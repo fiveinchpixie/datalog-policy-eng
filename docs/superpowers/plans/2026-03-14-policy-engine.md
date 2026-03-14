@@ -1222,3 +1222,939 @@ Expected: all tests pass; no regressions.
 git add src/policy/watcher.rs
 git commit -m "feat: add PolicyWatcher trait and PolicySet"
 ```
+
+---
+
+## Chunk 3: DSL Parsing
+
+**Covers:** `src/dsl/ast.rs`, `src/dsl/grammar.pest`, `src/dsl/parser.rs`
+
+**Goal:** Given a DSL source string, produce a typed AST. No CozoDB involved yet — this chunk is purely about parsing text into structured Rust types. The compiler (Chunk 4) will walk the AST and produce a `CompiledPolicy`.
+
+**Parsing strategy:** pest PEG parser. The grammar file drives everything. `parser.rs` wraps pest's output into the AST types defined in `ast.rs`. All three files are tightly coupled and built together in one TDD cycle (grammar + parser + AST tests are tested together).
+
+---
+
+### Task 9: DSL AST types
+
+**Files:**
+- Create: `src/dsl/ast.rs`
+
+The AST is the output of parsing and the input to compilation. No logic here — pure data.
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `src/dsl/ast.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_decl_construction() {
+        let decl = PolicyDecl {
+            name: "default-authz".to_string(),
+            priority: 100,
+            rules: vec![
+                PolicyRule::Allow(AllowRule {
+                    conditions: vec![AtomCondition {
+                        predicate: "tool_call".to_string(),
+                        args: vec![
+                            Arg::Variable("call_id".to_string()),
+                            Arg::Variable("agent_id".to_string()),
+                            Arg::Variable("tool_name".to_string()),
+                        ],
+                    }
+                    .into()],
+                    effects: vec![],
+                }),
+                PolicyRule::Deny(DenyRule {
+                    conditions: vec![ConditionClause::True],
+                    reason: Some("no matching allow rule".to_string()),
+                    effects: vec![],
+                }),
+            ],
+        };
+        assert_eq!(decl.name, "default-authz");
+        assert_eq!(decl.priority, 100);
+        assert_eq!(decl.rules.len(), 2);
+    }
+
+    #[test]
+    fn grant_decl_variants() {
+        let call_any = GrantDecl {
+            role: "admin".to_string(),
+            permission: GrantPermission::CallAny,
+        };
+        let call_cat = GrantDecl {
+            role: "analyst".to_string(),
+            permission: GrantPermission::CallCategory("read-only".to_string()),
+        };
+        let access = GrantDecl {
+            role: "analyst".to_string(),
+            permission: GrantPermission::AccessPattern("data/public/*".to_string()),
+        };
+        assert!(matches!(call_any.permission, GrantPermission::CallAny));
+        assert!(matches!(call_cat.permission, GrantPermission::CallCategory(_)));
+        assert!(matches!(access.permission, GrantPermission::AccessPattern(_)));
+    }
+
+    #[test]
+    fn condition_clause_from_atom() {
+        let atom = AtomCondition {
+            predicate: "can_call".to_string(),
+            args: vec![
+                Arg::Variable("agent_id".to_string()),
+                Arg::Variable("tool_name".to_string()),
+            ],
+        };
+        let clause: ConditionClause = atom.into();
+        assert!(matches!(clause, ConditionClause::Atom(_)));
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+```bash
+cargo test --lib dsl::ast
+```
+
+Expected: compile error — AST types not defined.
+
+- [ ] **Step 3: Implement `src/dsl/ast.rs`**
+
+```rust
+// src/dsl/ast.rs
+
+/// Top-level declarations in a policy file, in order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Declaration {
+    Grant(GrantDecl),
+    Categorize(CategorizeDecl),
+    Classify(ClassifyDecl),
+    Pattern(PatternDecl),
+    Rule(RuleDecl),
+    Policy(PolicyDecl),
+}
+
+// ── Policy facts ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GrantDecl {
+    pub role: String,
+    pub permission: GrantPermission,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GrantPermission {
+    CallAny,
+    CallCategory(String),
+    AccessPattern(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CategorizeDecl {
+    pub tool: String,
+    pub category: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassifyDecl {
+    pub resource_pattern: String,
+    pub sensitivity: String,
+}
+
+// ── Patterns ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PatternDecl {
+    /// Pattern name without the leading `:` (e.g. `"sql_injection"`).
+    pub name: String,
+    /// Raw regex source string (without the `r"..."` wrapper).
+    pub source: String,
+}
+
+// ── Rules ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleDecl {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub conditions: Vec<ConditionClause>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Param {
+    Named(String),
+    Wildcard,
+    NamedWildcard(String),
+}
+
+// ── Policy blocks ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolicyDecl {
+    pub name: String,
+    pub priority: u32,
+    pub rules: Vec<PolicyRule>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PolicyRule {
+    Allow(AllowRule),
+    Deny(DenyRule),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AllowRule {
+    pub conditions: Vec<ConditionClause>,
+    pub effects: Vec<EffectDecl>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DenyRule {
+    pub conditions: Vec<ConditionClause>,
+    pub reason: Option<String>,
+    pub effects: Vec<EffectDecl>,
+}
+
+// ── Conditions ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConditionClause {
+    /// A positive atom: `predicate(args...)`
+    Atom(AtomCondition),
+    /// Negation: `not predicate(args...)`
+    Not(AtomCondition),
+    /// Disjunction: `matches(v, :p) or matches(v, :q)` — a flat list of atoms
+    /// any one of which satisfies the condition.
+    Or(Vec<AtomCondition>),
+    /// The literal `true` keyword — used in default-deny fallbacks.
+    True,
+}
+
+impl From<AtomCondition> for ConditionClause {
+    fn from(atom: AtomCondition) -> Self {
+        ConditionClause::Atom(atom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AtomCondition {
+    pub predicate: String,
+    pub args: Vec<Arg>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Arg {
+    StringLit(String),
+    Integer(i64),
+    Variable(String),
+    /// Anonymous wildcard `_`
+    Wildcard,
+    /// Named wildcard `_foo` — matches anything; name is for readability only
+    NamedWildcard(String),
+    /// Pattern reference `:name` — resolved to a compiled Regex at eval time
+    PatternRef(String),
+}
+
+// ── Effects ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum EffectDecl {
+    Redact { selector: String, classifier: String },
+    Mask   { selector: String, pattern: String, replacement: String },
+    Annotate { key: String, value: String },
+    Audit { level: AuditLevelDecl },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AuditLevelDecl {
+    Standard,
+    Elevated,
+    Critical,
+}
+
+/// A fully parsed policy file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolicyFile {
+    pub declarations: Vec<Declaration>,
+}
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+```bash
+cargo test --lib dsl::ast
+```
+
+Expected: all 3 tests pass.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/dsl/ast.rs
+git commit -m "feat: add DSL AST node types"
+```
+
+---
+
+### Task 10: DSL grammar
+
+**Files:**
+- Create: `src/dsl/grammar.pest`
+
+The pest grammar is the source of truth for what valid DSL looks like. Write it before the parser so the parser tests drive grammar corrections. Grammar is tested indirectly via the parser tests in Task 11 — there are no standalone grammar tests.
+
+- [ ] **Step 1: Write `src/dsl/grammar.pest`**
+
+```pest
+// src/dsl/grammar.pest
+
+// ── Whitespace and comments ───────────────────────────────────────────────────
+WHITESPACE = _{ " " | "\t" | "\n" | "\r" }
+COMMENT    = _{ "//" ~ (!"\n" ~ ANY)* ~ ("\n" | EOI) }
+
+// ── Primitives ────────────────────────────────────────────────────────────────
+ident        = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_" | "-")* }
+string       = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+raw_string   = @{ "r\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+integer      = @{ ASCII_DIGIT+ }
+pattern_ref  = @{ ":" ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+wildcard     = @{ "_" ~ (ASCII_ALPHANUMERIC | "_")* }
+
+// ── Top-level ─────────────────────────────────────────────────────────────────
+policy_file  =  { SOI ~ declaration* ~ EOI }
+declaration  =  { grant_decl | categorize_decl | classify_decl
+                | pattern_decl | rule_decl | policy_decl }
+
+// ── Policy facts ──────────────────────────────────────────────────────────────
+grant_decl   =  { "grant" ~ "role" ~ string ~ "can" ~ grant_perm ~ ";" }
+grant_perm   =  { call_any | call_category | access_pattern }
+call_any         = { "call" ~ "tool:any" }
+call_category    = { "call" ~ "tool:category" ~ "(" ~ string ~ ")" }
+access_pattern   = { "access" ~ "resource:pattern" ~ "(" ~ string ~ ")" }
+
+categorize_decl  = { "categorize" ~ "tool" ~ string ~ "as" ~ string ~ ";" }
+classify_decl    = { "classify" ~ "resource" ~ string ~ "as" ~ "sensitivity" ~ string ~ ";" }
+
+// ── Patterns ──────────────────────────────────────────────────────────────────
+pattern_decl     = { "pattern" ~ pattern_ref ~ "=" ~ raw_string ~ ";" }
+
+// ── Rules ─────────────────────────────────────────────────────────────────────
+rule_decl    =  { "rule" ~ ident ~ "(" ~ param_list ~ ")" ~ ":-" ~ condition_list ~ ";" }
+param_list   =  { param ~ ("," ~ param)* }
+param        =  { wildcard | ident }
+
+// ── Conditions ────────────────────────────────────────────────────────────────
+condition_list  =  { condition ~ ("," ~ condition)* }
+// or_condition must be tried before atom_condition so that
+//   matches(v, :p) or matches(v, :q)
+// parses as one Or clause rather than stopping after the first atom.
+condition       = _{ not_condition | or_condition | atom_condition | true_kw }
+not_condition   =  { "not" ~ atom_condition }
+true_kw         =  { "true" }
+or_condition    =  { atom_condition ~ ("or" ~ atom_condition)+ }
+atom_condition  =  { ident ~ "(" ~ arg_list? ~ ")" }
+arg_list        =  { arg ~ ("," ~ arg)* }
+
+arg             =  { string | integer | pattern_ref | wildcard | ident }
+
+// ── Policy blocks ─────────────────────────────────────────────────────────────
+policy_decl  =  { "policy" ~ string ~ "priority" ~ integer ~ "{" ~ policy_rule* ~ "}" }
+policy_rule  =  { allow_rule | deny_rule }
+
+allow_rule   =  { "allow" ~ "when" ~ condition_list ~ effect_clause* ~ ";" }
+deny_rule    =  { "deny" ~ "when" ~ condition_list ~ reason_clause? ~ effect_clause* ~ ";" }
+
+reason_clause   = { "reason" ~ string }
+effect_clause   = { "effect" ~ effect_type }
+effect_type     = { redact_effect | mask_effect | annotate_effect | audit_effect }
+
+redact_effect   = { "Redact" ~ "(" ~ "selector:" ~ string ~ "," ~ "classifier:" ~ string ~ ")" }
+mask_effect     = { "Mask"   ~ "(" ~ "selector:" ~ string ~ "," ~ "pattern:"    ~ string ~ ","
+                              ~ "replacement:" ~ string ~ ")" }
+annotate_effect = { "Annotate" ~ "(" ~ "key:" ~ string ~ "," ~ "value:" ~ string ~ ")" }
+audit_effect    = { "Audit" ~ "(" ~ "level:" ~ audit_level ~ ")" }
+audit_level     = { "Critical" | "Elevated" | "Standard" }
+```
+
+> **Grammar notes for implementer:**
+> - `WHITESPACE` and `COMMENT` rules prefixed with `_` are silent — pest consumes them automatically between tokens.
+> - `@{ }` rules are atomic — no implicit whitespace inside them. Used for `ident`, `string`, `raw_string`, `integer`, `pattern_ref`, `wildcard`.
+> - `condition` is a silent rule (`_{ }`) so it collapses into its matched child in the parse tree. This means `parse_condition` receives pairs with rule `not_condition`, `or_condition`, `atom_condition`, or `true_kw` directly — not wrapped in a `condition` pair.
+> - **`raw_string` limitation:** the rule `@{ "r\"" ~ (!"\"" ~ ANY)* ~ "\"" }` cannot match regex patterns that contain a literal `"` character (it stops at the first interior `"`). The spec's example patterns do not contain `"`, so this is not a problem for the current use cases. If future patterns need literal `"` characters, the grammar will need an escape mechanism.
+> - If the grammar produces parse errors on valid DSL, run `cargo test --test dsl_tests -- --nocapture` and inspect the pest error output.
+
+- [ ] **Step 2: Verify the grammar file exists and is non-empty**
+
+```bash
+wc -l src/dsl/grammar.pest
+```
+
+Expected: 50+ lines.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add src/dsl/grammar.pest
+git commit -m "feat: add DSL pest PEG grammar"
+```
+
+---
+
+### Task 11: DSL parser
+
+**Files:**
+- Create: `src/dsl/parser.rs`
+- Modify: `src/dsl/mod.rs` (expose `parse` function)
+
+The parser wraps pest's generated output into the AST types. `parse(source: &str) -> Result<PolicyFile, PolicyError>` is the public interface.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/dsl_tests.rs` with the parser tests (integration-style, using the public `parse` function):
+
+```rust
+// tests/dsl_tests.rs
+use datalog_noodle::dsl_parse;  // re-exported from lib in Step 5
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn parse_ok(src: &str) -> datalog_noodle::dsl::PolicyFile {
+    datalog_noodle::dsl_parse(src).expect("expected parse to succeed")
+}
+
+fn parse_err(src: &str) -> datalog_noodle::PolicyError {
+    datalog_noodle::dsl_parse(src).expect_err("expected parse to fail")
+}
+
+// ── Grant declarations ────────────────────────────────────────────────────────
+
+#[test]
+fn parse_grant_call_any() {
+    let src = r#"grant role "admin" can call tool:any;"#;
+    let file = parse_ok(src);
+    use datalog_noodle::dsl::ast::{Declaration, GrantDecl, GrantPermission};
+    assert_eq!(file.declarations.len(), 1);
+    assert!(matches!(
+        &file.declarations[0],
+        Declaration::Grant(GrantDecl { permission: GrantPermission::CallAny, .. })
+    ));
+}
+
+#[test]
+fn parse_grant_call_category() {
+    let src = r#"grant role "analyst" can call tool:category("read-only");"#;
+    let file = parse_ok(src);
+    use datalog_noodle::dsl::ast::{Declaration, GrantDecl, GrantPermission};
+    assert!(matches!(
+        &file.declarations[0],
+        Declaration::Grant(GrantDecl {
+            permission: GrantPermission::CallCategory(cat),
+            ..
+        }) if cat == "read-only"
+    ));
+}
+
+#[test]
+fn parse_pattern_decl() {
+    let src = r#"pattern :sql_injection = r"(?i)(drop|delete)\s+table";"#;
+    let file = parse_ok(src);
+    use datalog_noodle::dsl::ast::{Declaration, PatternDecl};
+    assert!(matches!(
+        &file.declarations[0],
+        Declaration::Pattern(PatternDecl { name, .. }) if name == "sql_injection"
+    ));
+}
+
+#[test]
+fn parse_rule_decl() {
+    let src = r#"
+        rule can_call(agent, tool) :-
+            agent_role(agent, role),
+            tool_category(tool, cat),
+            role_permission(role, "call", cat);
+    "#;
+    let file = parse_ok(src);
+    use datalog_noodle::dsl::ast::Declaration;
+    assert!(matches!(&file.declarations[0], Declaration::Rule(_)));
+    if let Declaration::Rule(r) = &file.declarations[0] {
+        assert_eq!(r.name, "can_call");
+        assert_eq!(r.params.len(), 2);
+        assert_eq!(r.conditions.len(), 3);
+    }
+}
+
+#[test]
+fn parse_policy_block_allow_and_deny() {
+    let src = r#"
+        policy "default-authz" priority 100 {
+            allow when
+                tool_call(call_id, agent_id, tool_name),
+                can_call(agent_id, tool_name);
+
+            deny when true
+                reason "no matching allow rule";
+        }
+    "#;
+    let file = parse_ok(src);
+    use datalog_noodle::dsl::ast::{Declaration, PolicyRule};
+    assert_eq!(file.declarations.len(), 1);
+    if let Declaration::Policy(p) = &file.declarations[0] {
+        assert_eq!(p.name, "default-authz");
+        assert_eq!(p.priority, 100);
+        assert_eq!(p.rules.len(), 2);
+        assert!(matches!(p.rules[0], PolicyRule::Allow(_)));
+        assert!(matches!(p.rules[1], PolicyRule::Deny(_)));
+    } else {
+        panic!("expected Policy declaration");
+    }
+}
+
+#[test]
+fn parse_policy_block_with_effects() {
+    let src = r#"
+        policy "pii-handling" priority 150 {
+            allow when
+                tool_call(call_id, agent_id, _tool),
+                content_tag(call_id, "pii", "high"),
+                can_call(agent_id, _tool)
+                effect Redact(selector: "response.content", classifier: "pii")
+                effect Audit(level: Elevated);
+        }
+    "#;
+    let file = parse_ok(src);
+    use datalog_noodle::dsl::ast::{Declaration, PolicyRule, EffectDecl, AuditLevelDecl};
+    if let Declaration::Policy(p) = &file.declarations[0] {
+        if let PolicyRule::Allow(allow) = &p.rules[0] {
+            assert_eq!(allow.effects.len(), 2);
+            assert!(matches!(allow.effects[0], EffectDecl::Redact { .. }));
+            assert!(matches!(
+                allow.effects[1],
+                EffectDecl::Audit { level: AuditLevelDecl::Elevated }
+            ));
+        } else { panic!("expected Allow rule"); }
+    } else { panic!("expected Policy declaration"); }
+}
+
+#[test]
+fn parse_or_condition_in_rule() {
+    let src = r#"
+        rule has_forbidden_arg(call_id) :-
+            call_arg(call_id, _, value),
+            matches(value, :sql_injection) or matches(value, :path_traversal);
+    "#;
+    let file = parse_ok(src);
+    use datalog_noodle::dsl::ast::{Declaration, ConditionClause};
+    if let Declaration::Rule(r) = &file.declarations[0] {
+        assert!(r.conditions.iter().any(|c| matches!(c, ConditionClause::Or(_))));
+    }
+}
+
+// ── Not conditions ────────────────────────────────────────────────────────────
+
+#[test]
+fn parse_not_condition_in_policy() {
+    let src = r#"
+        policy "pii-handling" priority 150 {
+            deny when
+                tool_call(call_id, agent_id, _tool),
+                content_tag(call_id, "pii", "high"),
+                not can_call(agent_id, _tool)
+                reason "agent not permitted and PII present"
+                effect Audit(level: Critical);
+        }
+    "#;
+    let file = parse_ok(src);
+    use datalog_noodle::dsl::ast::{Declaration, PolicyRule, ConditionClause};
+    if let Declaration::Policy(p) = &file.declarations[0] {
+        if let PolicyRule::Deny(deny) = &p.rules[0] {
+            assert!(deny.conditions.iter().any(|c| matches!(c, ConditionClause::Not(_))));
+            assert_eq!(deny.reason.as_deref(), Some("agent not permitted and PII present"));
+        } else { panic!("expected Deny rule"); }
+    } else { panic!("expected Policy declaration"); }
+}
+
+// ── Categorize and classify declarations ─────────────────────────────────────
+
+#[test]
+fn parse_categorize_decl() {
+    let src = r#"
+        categorize tool "db_query" as "read-only";
+        categorize tool "db_write" as "write";
+    "#;
+    let file = parse_ok(src);
+    use datalog_noodle::dsl::ast::{Declaration, CategorizeDecl};
+    assert_eq!(file.declarations.len(), 2);
+    assert!(matches!(
+        &file.declarations[0],
+        Declaration::Categorize(CategorizeDecl { tool, category })
+        if tool == "db_query" && category == "read-only"
+    ));
+}
+
+#[test]
+fn parse_classify_decl() {
+    let src = r#"
+        classify resource "data/finance/*" as sensitivity "high";
+        classify resource "data/public/*"  as sensitivity "low";
+    "#;
+    let file = parse_ok(src);
+    use datalog_noodle::dsl::ast::{Declaration, ClassifyDecl};
+    assert_eq!(file.declarations.len(), 2);
+    assert!(matches!(
+        &file.declarations[0],
+        Declaration::Classify(ClassifyDecl { resource_pattern, sensitivity })
+        if resource_pattern == "data/finance/*" && sensitivity == "high"
+    ));
+}
+
+// ── Error cases ───────────────────────────────────────────────────────────────
+
+#[test]
+fn parse_error_missing_semicolon() {
+    let src = r#"grant role "admin" can call tool:any"#;
+    let err = parse_err(src);
+    assert!(matches!(err, datalog_noodle::PolicyError::Parse(_)));
+}
+
+#[test]
+fn parse_error_unknown_keyword() {
+    let src = r#"forbid role "guest" from everything;"#;
+    let err = parse_err(src);
+    assert!(matches!(err, datalog_noodle::PolicyError::Parse(_)));
+}
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+```bash
+cargo test --test dsl_tests
+```
+
+Expected: compile error — `dsl_parse` and `dsl` module not accessible from test.
+
+- [ ] **Step 3: Implement `src/dsl/parser.rs`**
+
+```rust
+// src/dsl/parser.rs
+use pest::Parser;
+use pest::iterators::Pair;
+use pest_derive::Parser;
+use crate::error::PolicyError;
+use crate::dsl::ast::*;
+
+#[derive(Parser)]
+#[grammar = "dsl/grammar.pest"]
+struct DslParser;
+
+/// Parse a DSL source string into a `PolicyFile` AST.
+/// Returns `PolicyError::Parse` on any syntax error.
+pub fn parse(source: &str) -> Result<PolicyFile, PolicyError> {
+    let pairs = DslParser::parse(Rule::policy_file, source)
+        .map_err(|e| PolicyError::Parse(e.to_string()))?;
+    let mut declarations = Vec::new();
+    for pair in pairs {
+        match pair.as_rule() {
+            Rule::declaration => {
+                let inner = pair.into_inner().next().unwrap();
+                declarations.push(parse_declaration(inner)?);
+            }
+            Rule::EOI => {}
+            _ => {}
+        }
+    }
+    Ok(PolicyFile { declarations })
+}
+
+fn parse_declaration(pair: Pair<Rule>) -> Result<Declaration, PolicyError> {
+    match pair.as_rule() {
+        Rule::grant_decl      => Ok(Declaration::Grant(parse_grant(pair)?)),
+        Rule::categorize_decl => Ok(Declaration::Categorize(parse_categorize(pair)?)),
+        Rule::classify_decl   => Ok(Declaration::Classify(parse_classify(pair)?)),
+        Rule::pattern_decl    => Ok(Declaration::Pattern(parse_pattern(pair)?)),
+        Rule::rule_decl       => Ok(Declaration::Rule(parse_rule_decl(pair)?)),
+        Rule::policy_decl     => Ok(Declaration::Policy(parse_policy_decl(pair)?)),
+        r => Err(PolicyError::Parse(format!("unexpected rule: {:?}", r))),
+    }
+}
+
+fn parse_grant(pair: Pair<Rule>) -> Result<GrantDecl, PolicyError> {
+    let mut inner = pair.into_inner();
+    let role = unquote(inner.next().unwrap().as_str());
+    let perm_pair = inner.next().unwrap().into_inner().next().unwrap();
+    let permission = match perm_pair.as_rule() {
+        Rule::call_any      => GrantPermission::CallAny,
+        Rule::call_category => {
+            let s = unquote(perm_pair.into_inner().next().unwrap().as_str());
+            GrantPermission::CallCategory(s)
+        }
+        Rule::access_pattern => {
+            let s = unquote(perm_pair.into_inner().next().unwrap().as_str());
+            GrantPermission::AccessPattern(s)
+        }
+        r => return Err(PolicyError::Parse(format!("unexpected grant perm: {:?}", r))),
+    };
+    Ok(GrantDecl { role, permission })
+}
+
+fn parse_categorize(pair: Pair<Rule>) -> Result<CategorizeDecl, PolicyError> {
+    let mut inner = pair.into_inner();
+    let tool     = unquote(inner.next().unwrap().as_str());
+    let category = unquote(inner.next().unwrap().as_str());
+    Ok(CategorizeDecl { tool, category })
+}
+
+fn parse_classify(pair: Pair<Rule>) -> Result<ClassifyDecl, PolicyError> {
+    let mut inner = pair.into_inner();
+    let resource_pattern = unquote(inner.next().unwrap().as_str());
+    let sensitivity      = unquote(inner.next().unwrap().as_str());
+    Ok(ClassifyDecl { resource_pattern, sensitivity })
+}
+
+fn parse_pattern(pair: Pair<Rule>) -> Result<PatternDecl, PolicyError> {
+    let mut inner = pair.into_inner();
+    let name_tok = inner.next().unwrap().as_str(); // ":sql_injection"
+    let name     = name_tok.trim_start_matches(':').to_string();
+    let raw      = inner.next().unwrap().as_str();  // r"..."
+    let source   = raw
+        .trim_start_matches("r\"")
+        .trim_end_matches('"')
+        .to_string();
+    Ok(PatternDecl { name, source })
+}
+
+fn parse_rule_decl(pair: Pair<Rule>) -> Result<RuleDecl, PolicyError> {
+    let mut inner = pair.into_inner();
+    let name   = inner.next().unwrap().as_str().to_string();
+    let params = parse_param_list(inner.next().unwrap())?;
+    let conditions = parse_condition_list(inner.next().unwrap())?;
+    Ok(RuleDecl { name, params, conditions })
+}
+
+fn parse_param_list(pair: Pair<Rule>) -> Result<Vec<Param>, PolicyError> {
+    // Each child of `param_list` is a `param` pair. Each `param` wraps
+    // either a `wildcard` or an `ident`. Dispatch on the inner rule variant
+    // rather than inspecting raw text, so future grammar changes don't silently
+    // break this.
+    pair.into_inner().map(|param_pair| {
+        let inner = param_pair.into_inner().next().unwrap();
+        match inner.as_rule() {
+            Rule::wildcard => {
+                let s = inner.as_str();
+                if s == "_" {
+                    Ok(Param::Wildcard)
+                } else {
+                    Ok(Param::NamedWildcard(s[1..].to_string()))
+                }
+            }
+            Rule::ident => Ok(Param::Named(inner.as_str().to_string())),
+            r => Err(PolicyError::Parse(format!("unexpected param rule: {:?}", r))),
+        }
+    }).collect()
+}
+
+fn parse_condition_list(pair: Pair<Rule>) -> Result<Vec<ConditionClause>, PolicyError> {
+    pair.into_inner().map(parse_condition).collect()
+}
+
+fn parse_condition(pair: Pair<Rule>) -> Result<ConditionClause, PolicyError> {
+    match pair.as_rule() {
+        Rule::atom_condition => Ok(ConditionClause::Atom(parse_atom(pair)?)),
+        Rule::not_condition  => {
+            let inner = pair.into_inner().next().unwrap();
+            Ok(ConditionClause::Not(parse_atom(inner)?))
+        }
+        Rule::or_condition   => {
+            let atoms: Result<Vec<_>, _> = pair.into_inner().map(parse_atom).collect();
+            Ok(ConditionClause::Or(atoms?))
+        }
+        Rule::true_kw        => Ok(ConditionClause::True),
+        r => Err(PolicyError::Parse(format!("unexpected condition: {:?}", r))),
+    }
+}
+
+fn parse_atom(pair: Pair<Rule>) -> Result<AtomCondition, PolicyError> {
+    let mut inner = pair.into_inner();
+    let predicate = inner.next().unwrap().as_str().to_string();
+    let args = match inner.next() {
+        Some(arg_list) => arg_list.into_inner().map(parse_arg).collect::<Result<_, _>>()?,
+        None           => vec![],
+    };
+    Ok(AtomCondition { predicate, args })
+}
+
+fn parse_arg(pair: Pair<Rule>) -> Result<Arg, PolicyError> {
+    match pair.as_rule() {
+        Rule::string      => Ok(Arg::StringLit(unquote(pair.as_str()))),
+        Rule::integer     => Ok(Arg::Integer(pair.as_str().parse().unwrap())),
+        Rule::pattern_ref => Ok(Arg::PatternRef(pair.as_str().trim_start_matches(':').to_string())),
+        Rule::wildcard    => {
+            let s = pair.as_str();
+            if s == "_" {
+                Ok(Arg::Wildcard)
+            } else {
+                Ok(Arg::NamedWildcard(s[1..].to_string()))
+            }
+        }
+        Rule::ident       => Ok(Arg::Variable(pair.as_str().to_string())),
+        r => Err(PolicyError::Parse(format!("unexpected arg: {:?}", r))),
+    }
+}
+
+fn parse_policy_decl(pair: Pair<Rule>) -> Result<PolicyDecl, PolicyError> {
+    let mut inner = pair.into_inner();
+    let name     = unquote(inner.next().unwrap().as_str());
+    let priority = inner.next().unwrap().as_str().parse::<u32>().unwrap();
+    let rules: Result<Vec<_>, _> = inner.map(parse_policy_rule).collect();
+    Ok(PolicyDecl { name, priority, rules: rules? })
+}
+
+fn parse_policy_rule(pair: Pair<Rule>) -> Result<PolicyRule, PolicyError> {
+    let inner = pair.into_inner().next().unwrap();
+    match inner.as_rule() {
+        Rule::allow_rule => Ok(PolicyRule::Allow(parse_allow_rule(inner)?)),
+        Rule::deny_rule  => Ok(PolicyRule::Deny(parse_deny_rule(inner)?)),
+        r => Err(PolicyError::Parse(format!("unexpected policy rule: {:?}", r))),
+    }
+}
+
+fn parse_allow_rule(pair: Pair<Rule>) -> Result<AllowRule, PolicyError> {
+    let mut conditions = Vec::new();
+    let mut effects    = Vec::new();
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::condition_list => conditions = parse_condition_list(child)?,
+            Rule::effect_clause  => effects.push(parse_effect_clause(child)?),
+            _ => {}
+        }
+    }
+    Ok(AllowRule { conditions, effects })
+}
+
+fn parse_deny_rule(pair: Pair<Rule>) -> Result<DenyRule, PolicyError> {
+    let mut conditions = Vec::new();
+    let mut reason     = None;
+    let mut effects    = Vec::new();
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::condition_list => conditions = parse_condition_list(child)?,
+            Rule::reason_clause  => {
+                reason = Some(unquote(child.into_inner().next().unwrap().as_str()));
+            }
+            Rule::effect_clause  => effects.push(parse_effect_clause(child)?),
+            _ => {}
+        }
+    }
+    Ok(DenyRule { conditions, reason, effects })
+}
+
+fn parse_effect_clause(pair: Pair<Rule>) -> Result<EffectDecl, PolicyError> {
+    let effect = pair.into_inner().next().unwrap();
+    let inner_effect = effect.into_inner().next().unwrap();
+    match inner_effect.as_rule() {
+        Rule::redact_effect => {
+            let mut i = inner_effect.into_inner();
+            Ok(EffectDecl::Redact {
+                selector:   unquote(i.next().unwrap().as_str()),
+                classifier: unquote(i.next().unwrap().as_str()),
+            })
+        }
+        Rule::mask_effect => {
+            let mut i = inner_effect.into_inner();
+            Ok(EffectDecl::Mask {
+                selector:    unquote(i.next().unwrap().as_str()),
+                pattern:     unquote(i.next().unwrap().as_str()),
+                replacement: unquote(i.next().unwrap().as_str()),
+            })
+        }
+        Rule::annotate_effect => {
+            let mut i = inner_effect.into_inner();
+            Ok(EffectDecl::Annotate {
+                key:   unquote(i.next().unwrap().as_str()),
+                value: unquote(i.next().unwrap().as_str()),
+            })
+        }
+        Rule::audit_effect => {
+            let level_str = inner_effect.into_inner().next().unwrap().as_str();
+            let level = match level_str {
+                "Critical" => AuditLevelDecl::Critical,
+                "Elevated" => AuditLevelDecl::Elevated,
+                "Standard" => AuditLevelDecl::Standard,
+                s => return Err(PolicyError::Parse(format!("unknown audit level: {}", s))),
+            };
+            Ok(EffectDecl::Audit { level })
+        }
+        r => Err(PolicyError::Parse(format!("unexpected effect: {:?}", r))),
+    }
+}
+
+/// Strip exactly one surrounding double-quote on each side from a `string` token.
+/// The `string` grammar rule always produces exactly one leading and one trailing `"`.
+fn unquote(s: &str) -> String {
+    s[1..s.len() - 1].to_string()
+}
+```
+
+- [ ] **Step 4: Update `src/dsl/mod.rs` to expose the parse function and make `ast` public**
+
+```rust
+// src/dsl/mod.rs
+pub mod ast;                    // public so integration tests can use dsl::ast::*
+pub(crate) mod compiler;
+pub(crate) mod parser;
+
+pub(crate) use parser::parse;
+
+pub use ast::PolicyFile;        // convenience re-export
+```
+
+- [ ] **Step 5: Update `src/lib.rs` to make the `dsl` module public and expose `dsl_parse`**
+
+In `src/lib.rs`, change the `dsl` module declaration from `pub(crate)` to `pub`:
+
+```rust
+// src/lib.rs  (replace the existing pub(crate) mod dsl line)
+pub mod dsl;                    // was pub(crate) — making it public exposes dsl::ast to tests
+```
+
+Then add the `dsl_parse` free function (no new module block needed):
+
+```rust
+/// Parse a DSL source string into a `PolicyFile` AST.
+/// Exposed for integration tests and gateway use.
+pub fn dsl_parse(source: &str) -> Result<dsl::ast::PolicyFile, error::PolicyError> {
+    dsl::parser::parse(source)
+}
+```
+
+The integration tests access `datalog_noodle::dsl::ast::*` via the now-public `dsl` module and call `datalog_noodle::dsl_parse(...)`. No module name conflict occurs.
+
+- [ ] **Step 6: Run the integration tests**
+
+```bash
+cargo test --test dsl_tests
+```
+
+Expected: all 12 tests pass. If a test fails due to parse errors, run with `-- --nocapture` and inspect the pest error output. Common fixes:
+- Grammar rule name mismatch (check `Rule::` variants match the grammar rule names)
+- Ambiguous rule ordering in the grammar (try reordering alternatives)
+- `unquote` stripping the wrong characters (check `pair.as_str()` for a quoted string includes the quotes)
+
+- [ ] **Step 7: Run full test suite**
+
+```bash
+cargo test
+```
+
+Expected: all tests pass.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/dsl/ast.rs src/dsl/grammar.pest src/dsl/parser.rs src/dsl/mod.rs src/lib.rs tests/dsl_tests.rs
+git commit -m "feat: add DSL parser (pest grammar + AST + parse function)"
+```
