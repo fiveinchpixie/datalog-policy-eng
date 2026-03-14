@@ -2158,3 +2158,961 @@ Expected: all tests pass.
 git add src/dsl/ast.rs src/dsl/grammar.pest src/dsl/parser.rs src/dsl/mod.rs src/lib.rs tests/dsl_tests.rs
 git commit -m "feat: add DSL parser (pest grammar + AST + parse function)"
 ```
+
+---
+
+## Chunk 4: DSL Compilation
+
+**Covers:** `src/dsl/compiler.rs`
+
+**Goal:** Transform a validated `PolicyFile` AST into a `CompiledPolicy` — a CozoDB instance preloaded with policy facts and a `decision_script` string that encodes all decision logic as parameterized Datalog.
+
+**Compilation pipeline:**
+1. Validate: check undefined pattern references; undefined rule references are permitted (CozoDB will error at eval time)
+2. Create CozoDB stored relations for policy facts
+3. Compile `PatternDecl` → `Regex` objects in `CompiledPolicy.patterns` + insert source into CozoDB `forbidden_pattern` relation for auditability
+4. Compile `GrantDecl`, `CategorizeDecl`, `ClassifyDecl` → insert rows into stored relations
+5. Build `decision_script`: a single Cozo script that binds request facts from `$params`, defines inline rules from DSL `rule` blocks, encodes priority-ordered decision logic, and ends with `?[verdict, reason, effects_json, block_name] := ...`
+
+**Key design decisions baked into the generated script:**
+- Request facts arrive as `$param` vectors (e.g., `tool_call[call_id, agent_id, tool_name] <- $tool_calls`)
+- `matched_value[value, pattern_name] <- $matched_values` is populated by the evaluator's builtins pre-pass — the compiler rewrites every `matches(value, :pattern_name)` condition to `matched_value[value, "pattern_name"]`
+- Stored policy fact relations are accessed with the `*relation_name[...]` prefix in Cozo; request fact relations (from params) have no prefix
+- `Or` conditions in rule bodies are expanded to multiple rule heads (one per Or arm)
+- Priority ordering: for each block at priority P, its sub-rules include `not b_{higher_block}_matched[call_id]` guards; deny beats allow at equal priority via separate decision rules
+- `deny when true` compiles `ConditionClause::True` to `tool_call[call_id, _, _]` to bind `call_id`
+- Effects are serialized to a JSON string embedded in the Cozo rule head
+
+---
+
+### Task 12: DSL Compiler
+
+**Files:**
+- Create: `src/dsl/compiler.rs`
+- Modify: `src/dsl/mod.rs` (expose `compile` function)
+- Modify: `src/lib.rs` (expose `dsl_compile` free function)
+- Modify: `tests/dsl_tests.rs` (add compiler tests)
+
+- [ ] **Step 1: Write failing validation error tests**
+
+Add to `tests/dsl_tests.rs`:
+
+```rust
+// ── Compiler validation errors ────────────────────────────────────────────────
+
+#[test]
+fn compile_error_undefined_pattern_ref() {
+    let src = r#"
+        rule bad(call_id) :-
+            call_arg(call_id, _, value),
+            matches(value, :undefined_pattern);
+    "#;
+    let err = datalog_noodle::dsl_compile(src, "v1")
+        .expect_err("expected compile error");
+    assert!(
+        matches!(err, datalog_noodle::PolicyError::Compile(_)),
+        "expected PolicyError::Compile, got {:?}", err
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("undefined_pattern"),
+        "error message should name the undefined pattern, got: {}", msg
+    );
+}
+
+#[test]
+fn compile_error_invalid_regex() {
+    // Regex with unclosed bracket — fails at Regex::new time
+    let src = r#"pattern :bad = r"[unclosed";"#;
+    let err = datalog_noodle::dsl_compile(src, "v1")
+        .expect_err("expected compile error");
+    assert!(matches!(err, datalog_noodle::PolicyError::Compile(_)));
+}
+
+#[test]
+fn compile_error_allow_when_true() {
+    // `allow when true` is a security hole — unconditionally allows every call.
+    // Only `deny when true` is permitted.
+    let src = r#"
+        policy "bad" priority 100 {
+            allow when true;
+        }
+    "#;
+    let err = datalog_noodle::dsl_compile(src, "v1")
+        .expect_err("expected compile error for allow when true");
+    assert!(matches!(err, datalog_noodle::PolicyError::Compile(_)));
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("allow when true") || msg.contains("not permitted"),
+        "error should mention allow-when-true restriction, got: {}", err
+    );
+}
+
+#[test]
+fn compile_error_or_in_policy_block() {
+    // Or conditions are not supported directly in policy blocks.
+    // Authors must extract Or logic into a `rule` declaration.
+    let src = r#"
+        pattern :p1 = r"foo";
+        pattern :p2 = r"bar";
+        policy "bad" priority 100 {
+            deny when
+                tool_call(call_id, _, _),
+                matches(v, :p1) or matches(v, :p2);
+        }
+    "#;
+    let err = datalog_noodle::dsl_compile(src, "v1")
+        .expect_err("expected compile error for Or in policy block");
+    assert!(matches!(err, datalog_noodle::PolicyError::Compile(_)));
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("or") || msg.contains("policy block"),
+        "error message should mention Or or policy block restriction, got: {}", err
+    );
+}
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+```bash
+cargo test --test dsl_tests compile_error
+```
+
+Expected: compile error — `dsl_compile` not defined.
+
+- [ ] **Step 3: Implement `src/dsl/compiler.rs` — validation and skeleton**
+
+```rust
+// src/dsl/compiler.rs
+use std::collections::{HashMap, HashSet};
+use regex::Regex;
+use crate::dsl::ast::*;
+use crate::error::PolicyError;
+use crate::policy::compiled::CompiledPolicy;
+
+/// Predicate names that map to CozoDB *stored* relations.
+/// These are prefixed with `*` in generated Cozo queries.
+/// Request-fact predicates (tool_call, agent_role, call_arg, etc.) have no prefix.
+///
+/// This list covers all policy fact relations defined in the spec, even those
+/// not yet inserted by this compiler (e.g. clearance_grants, tag_effect).
+/// If a stored relation is missing from this list, rules that reference it will
+/// silently emit it without the `*` prefix and fail at eval time with a
+/// "relation not found" error rather than a compile-time error.
+const STORED_RELATIONS: &[&str] = &[
+    "role_permission",
+    "tool_category",
+    "resource_sensitivity",
+    "forbidden_pattern",
+    "clearance_grants",
+    "forbidden_arg_key",
+    "allowed_domain",
+    "tag_effect",
+    "sensitivity_effect",
+];
+
+/// Compile a DSL source string into a `CompiledPolicy`.
+///
+/// Returns `PolicyError::Parse` on syntax errors (from the parser).
+/// Returns `PolicyError::Compile` on semantic errors (undefined patterns, invalid regex, etc.).
+pub fn compile(source: &str, version: &str) -> Result<CompiledPolicy, PolicyError> {
+    let ast = crate::dsl::parser::parse(source)?;
+    compile_ast(ast, version)
+}
+
+fn compile_ast(file: PolicyFile, version: &str) -> Result<CompiledPolicy, PolicyError> {
+    validate(&file)?;
+    let db = cozo::DbInstance::new("mem", "", serde_json::json!({}))
+        .map_err(|e| PolicyError::Compile(format!("failed to create CozoDB: {}", e)))?;
+    init_db(&db)?;
+    let patterns = compile_patterns(&file, &db)?;
+    compile_policy_facts(&file, &db)?;
+    let decision_script = build_decision_script(&file)?;
+    Ok(CompiledPolicy { version: version.to_string(), db, decision_script, patterns })
+}
+
+// ── Validation ────────────────────────────────────────────────────────────────
+
+fn validate(file: &PolicyFile) -> Result<(), PolicyError> {
+    let declared_patterns: HashSet<&str> = file.declarations.iter()
+        .filter_map(|d| match d {
+            Declaration::Pattern(p) => Some(p.name.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    for decl in &file.declarations {
+        match decl {
+            Declaration::Rule(r) => {
+                // Rule names must be valid CozoDB identifiers: letters, digits, underscores.
+                // The grammar allows hyphens in idents, but CozoDB rejects them.
+                if !r.name.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
+                    || !r.name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                {
+                    return Err(PolicyError::Compile(format!(
+                        "rule name `{}` is not a valid CozoDB identifier; \
+                         use only letters, digits, and underscores (no hyphens)",
+                        r.name
+                    )));
+                }
+                let or_count = r.conditions.iter()
+                    .filter(|c| matches!(c, ConditionClause::Or(_)))
+                    .count();
+                if or_count > 1 {
+                    return Err(PolicyError::Compile(format!(
+                        "rule `{}` has {} Or conditions; at most one Or group is supported per rule. \
+                         Split into separate rule declarations instead.",
+                        r.name, or_count
+                    )));
+                }
+                // `True` is only valid as the sole condition in a policy-block `deny when true`.
+                // In a rule body it introduces an unbound `call_id` variable at eval time.
+                if r.conditions.iter().any(|c| matches!(c, ConditionClause::True)) {
+                    return Err(PolicyError::Compile(format!(
+                        "rule `{}` uses `true` as a condition; `true` is only valid in policy \
+                         blocks as the sole condition in `deny when true`",
+                        r.name
+                    )));
+                }
+                for cond in &r.conditions {
+                    check_pattern_refs(cond, &declared_patterns)?;
+                }
+            }
+            Declaration::Policy(p) => {
+                for rule in &p.rules {
+                    let conditions = match rule {
+                        PolicyRule::Allow(a) => &a.conditions,
+                        PolicyRule::Deny(d) => &d.conditions,
+                    };
+                    // `allow when true` is a security hole: it unconditionally allows every
+                    // call in the block. Only `deny when true` is valid (default-deny fallback).
+                    if matches!(rule, PolicyRule::Allow(_))
+                        && conditions.iter().any(|c| matches!(c, ConditionClause::True))
+                    {
+                        return Err(PolicyError::Compile(
+                            "`allow when true` is not permitted; `true` may only appear \
+                             in `deny when true` as the default-deny fallback".to_string()
+                        ));
+                    }
+                    for cond in conditions {
+                        check_pattern_refs(cond, &declared_patterns)?;
+                        // Or conditions in policy blocks are not supported.
+                        // The Cozo compiler cannot expand them to multiple decision rule
+                        // heads automatically in that context. Authors must use a `rule`
+                        // declaration to express the Or logic.
+                        if matches!(cond, ConditionClause::Or(_)) {
+                            return Err(PolicyError::Compile(
+                                "Or conditions are not allowed directly in policy blocks; \
+                                 extract the logic into a `rule` declaration instead".to_string()
+                            ));
+                        }
+                    }
+                    // `True` must be the sole condition (mixing it with others is nonsensical).
+                    if conditions.iter().any(|c| matches!(c, ConditionClause::True))
+                        && conditions.len() > 1
+                    {
+                        return Err(PolicyError::Compile(
+                            "`true` cannot be mixed with other conditions; \
+                             use it alone as `deny when true` for the default-deny fallback"
+                                .to_string()
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn check_pattern_refs(cond: &ConditionClause, declared: &HashSet<&str>) -> Result<(), PolicyError> {
+    let atoms: Vec<&AtomCondition> = match cond {
+        ConditionClause::Atom(a) => vec![a],
+        ConditionClause::Not(a) => vec![a],
+        ConditionClause::Or(atoms) => atoms.iter().collect(),
+        ConditionClause::True => return Ok(()),
+    };
+    for atom in atoms {
+        if atom.predicate == "matches" {
+            for arg in &atom.args {
+                if let Arg::PatternRef(name) = arg {
+                    if !declared.contains(name.as_str()) {
+                        return Err(PolicyError::Compile(format!(
+                            "undefined pattern :{name}; declare it with `pattern :{name} = r\"...\";`"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+```
+
+- [ ] **Step 4a: Wire up `dsl_compile` in `mod.rs` and `lib.rs`**
+
+Chunk 3 Task 11 Step 4 already wrote `src/dsl/mod.rs` with `pub(crate) mod compiler;` present. Add only the `use` re-export line — do NOT add a second `mod compiler;` declaration:
+
+```rust
+// src/dsl/mod.rs — add only this line (mod compiler; already present from Chunk 3)
+pub(crate) use compiler::compile;
+```
+
+In `src/lib.rs`, add:
+```rust
+/// Compile a DSL source string into a `CompiledPolicy`.
+pub fn dsl_compile(source: &str, version: &str) -> Result<policy::compiled::CompiledPolicy, error::PolicyError> {
+    dsl::compiler::compile(source, version)
+}
+```
+
+- [ ] **Step 4b: Run validation tests to verify they pass**
+
+```bash
+cargo test --test dsl_tests compile_error
+```
+
+Expected: all 3 `compile_error_*` tests pass.
+
+- [ ] **Step 4c: Verify the cozo `run_script` param type**
+
+Before writing tests that pass params to `run_script`, check the actual API:
+
+```bash
+cargo doc -p cozo --open
+```
+
+Find `DbInstance::run_script`. The third argument (params) is one of:
+- `BTreeMap<String, cozo::DataValue>` — use `cozo::DataValue::List(vec![])`
+- `BTreeMap<String, serde_json::Value>` — use `serde_json::json!([])`
+
+Update all `run_script` param arguments in Steps 5 and 7 to match. The tests as written assume `cozo::DataValue`; substitute `serde_json::json!([])` if needed.
+
+- [ ] **Step 5: Write failing compilation success tests**
+
+Add to `src/dsl/compiler.rs` (inside `#[cfg(test)] mod tests`):
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compile_minimal_policy() {
+        let src = r#"policy "default-deny" priority 100 { deny when true reason "no rule matched"; }"#;
+        let policy = compile(src, "v1").expect("compile succeeded");
+        assert_eq!(policy.version, "v1");
+        // decision_script must reference the block
+        assert!(
+            policy.decision_script.contains("b_default_deny"),
+            "decision_script missing block name: {}", policy.decision_script
+        );
+    }
+
+    #[test]
+    fn compile_pattern_creates_regex() {
+        let src = r#"pattern :sql_injection = r"(?i)(drop|delete)\s+table";"#;
+        let policy = compile(src, "v1").expect("compile succeeded");
+        assert!(policy.patterns.contains_key("sql_injection"));
+        assert!(policy.patterns["sql_injection"].is_match("DROP TABLE users"));
+        assert!(!policy.patterns["sql_injection"].is_match("SELECT * FROM users"));
+    }
+
+    #[test]
+    fn compile_grant_stored_in_cozo() {
+        let src = r#"grant role "analyst" can call tool:category("read-only");"#;
+        let policy = compile(src, "v1").expect("compile succeeded");
+        let result = policy.db
+            .run_script("?[role, action, rp] := *role_permission[role, action, rp]", Default::default())
+            .expect("query succeeded");
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn compile_categorize_stored_in_cozo() {
+        let src = r#"categorize tool "db_query" as "read-only";"#;
+        let policy = compile(src, "v1").expect("compile succeeded");
+        let result = policy.db
+            .run_script("?[tn, cat] := *tool_category[tn, cat]", Default::default())
+            .expect("query succeeded");
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn compile_classify_stored_in_cozo() {
+        let src = r#"classify resource "data/finance/*" as sensitivity "high";"#;
+        let policy = compile(src, "v1").expect("compile succeeded");
+        let result = policy.db
+            .run_script("?[up, lvl] := *resource_sensitivity[up, lvl]", Default::default())
+            .expect("query succeeded");
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn compile_decision_script_no_syntax_error() {
+        // Compile a representative policy and verify the generated decision_script
+        // actually executes in CozoDB with no errors.
+        // Supply empty param vectors for each request fact type — this lets CozoDB run
+        // the full script (rather than failing on a missing-param error) and confirms
+        // both syntax and structural correctness. Zero rows are expected since there
+        // are no request facts to match against.
+        use std::collections::BTreeMap;
+        let src = r#"
+            grant role "analyst" can call tool:category("read-only");
+            categorize tool "db_query" as "read-only";
+            rule can_call(agent, tool) :-
+                agent_role(agent, role),
+                tool_category(tool, cat),
+                role_permission(role, "call", cat);
+            policy "default-authz" priority 100 {
+                allow when
+                    tool_call(call_id, agent_id, tool_name),
+                    can_call(agent_id, tool_name);
+                deny when true
+                    reason "no matching allow rule";
+            }
+        "#;
+        let policy = compile(src, "v1").expect("compile succeeded");
+        // Supply empty param vectors for every request fact binding in REQUEST_FACT_BINDINGS.
+        // The `cozo::DataValue::List(vec![])` value represents an empty relation.
+        // If the cozo version in use expects `BTreeMap<String, serde_json::Value>` instead,
+        // replace `cozo::DataValue::List(vec![])` with `serde_json::json!([])`.
+        // Check `cargo doc -p cozo --open` for the exact `run_script` param type.
+        let mut params: BTreeMap<String, cozo::DataValue> = BTreeMap::new();
+        for key in &[
+            "tool_calls", "agents", "agent_roles", "agent_clearances", "delegations", "users",
+            "call_args", "tool_results", "resource_accesses", "resource_mimes",
+            "content_tags", "timestamps", "call_counts", "environment", "matched_values",
+        ] {
+            params.insert(key.to_string(), cozo::DataValue::List(vec![]));
+        }
+        let result = policy.db.run_script(&policy.decision_script, params)
+            .unwrap_or_else(|e| panic!(
+                "decision_script failed:\n{}\n\nError: {}", policy.decision_script, e
+            ));
+        // No request facts → no rules fire → zero output rows.
+        assert_eq!(result.rows.len(), 0, "expected empty result with no request facts");
+    }
+
+    #[test]
+    fn compile_pattern_also_stored_in_cozo() {
+        // Verify pattern source is inserted into the forbidden_pattern CozoDB relation
+        // for auditability, in addition to being compiled into the patterns HashMap.
+        let src = r#"pattern :sql_injection = r"(?i)(drop|delete)\s+table";"#;
+        let policy = compile(src, "v1").expect("compile succeeded");
+        let result = policy.db
+            .run_script("?[name, source] := *forbidden_pattern[name, source]", Default::default())
+            .expect("query succeeded");
+        assert_eq!(result.rows.len(), 1, "pattern source should be stored in forbidden_pattern");
+    }
+
+    #[test]
+    fn compile_matches_rewrites_to_matched_value() {
+        let src = r#"
+            pattern :sql_injection = r"(?i)(drop|delete)\s+table";
+            rule has_forbidden_arg(call_id) :-
+                call_arg(call_id, _, value),
+                matches(value, :sql_injection);
+        "#;
+        let policy = compile(src, "v1").expect("compile succeeded");
+        assert!(
+            policy.decision_script.contains("matched_value"),
+            "matches() should be rewritten to matched_value, got: {}",
+            policy.decision_script
+        );
+        assert!(
+            !policy.decision_script.contains("matches("),
+            "raw matches() should not appear in decision_script"
+        );
+    }
+}
+```
+
+- [ ] **Step 6: Run tests to verify they fail**
+
+```bash
+cargo test --lib dsl::compiler
+```
+
+Expected: compile errors — `init_db`, `compile_patterns`, etc. not defined.
+
+- [ ] **Step 7: Implement the full compiler**
+
+Add the remaining functions to `src/dsl/compiler.rs`:
+
+```rust
+// ── DB initialization ─────────────────────────────────────────────────────────
+
+fn init_db(db: &cozo::DbInstance) -> Result<(), PolicyError> {
+    // Each :create is a separate system script. CozoDB requires one system op per call.
+    // All nine spec-defined policy fact relations are created here so that:
+    // (a) STORED_RELATIONS prefix rewriting is correct for all of them, and
+    // (b) DSL rules referencing any of them produce valid scripts at compile time.
+    let creates = [
+        ":create role_permission {role: String, action: String, resource_pattern: String}",
+        ":create tool_category {tool_name: String, category: String}",
+        ":create resource_sensitivity {uri_pattern: String, level: String}",
+        ":create forbidden_pattern {name: String, source: String}",
+        ":create clearance_grants {clearance: String, privilege: String}",
+        ":create forbidden_arg_key {tool_name: String, key: String}",
+        ":create allowed_domain {uri_pattern: String}",
+        ":create tag_effect {tag: String, value: String, effect: String}",
+        ":create sensitivity_effect {level: String, effect: String}",
+    ];
+    for stmt in &creates {
+        db.run_script(stmt, Default::default())
+            .map_err(|e| PolicyError::Compile(format!("DB init error on `{stmt}`: {e}")))?;
+    }
+    Ok(())
+}
+
+// ── Pattern compilation ───────────────────────────────────────────────────────
+
+fn compile_patterns(
+    file: &PolicyFile,
+    db: &cozo::DbInstance,
+) -> Result<HashMap<String, Regex>, PolicyError> {
+    let mut patterns = HashMap::new();
+    for decl in &file.declarations {
+        if let Declaration::Pattern(p) = decl {
+            let regex = Regex::new(&p.source)
+                .map_err(|e| PolicyError::Compile(format!("invalid regex :{}: {}", p.name, e)))?;
+            patterns.insert(p.name.clone(), regex);
+            // Store source for auditability
+            let script = format!(
+                "?[name, source] <- [[{}, {}]]\n:put forbidden_pattern {{name, source}}",
+                cozo_str(&p.name),
+                cozo_str(&p.source)
+            );
+            db.run_script(&script, Default::default())
+                .map_err(|e| PolicyError::Compile(format!("pattern insert error: {e}")))?;
+        }
+    }
+    Ok(patterns)
+}
+
+// ── Policy fact compilation ───────────────────────────────────────────────────
+
+fn compile_policy_facts(file: &PolicyFile, db: &cozo::DbInstance) -> Result<(), PolicyError> {
+    for decl in &file.declarations {
+        match decl {
+            Declaration::Grant(g)      => compile_grant(g, db)?,
+            Declaration::Categorize(c) => compile_categorize(c, db)?,
+            Declaration::Classify(c)   => compile_classify(c, db)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn compile_grant(g: &GrantDecl, db: &cozo::DbInstance) -> Result<(), PolicyError> {
+    let (action, resource_pattern) = match &g.permission {
+        GrantPermission::CallAny          => ("call".to_string(), "*".to_string()),
+        GrantPermission::CallCategory(c)  => ("call".to_string(), c.clone()),
+        GrantPermission::AccessPattern(p) => ("access".to_string(), p.clone()),
+    };
+    let script = format!(
+        "?[role, action, resource_pattern] <- [[{}, {}, {}]]\n\
+         :put role_permission {{role, action, resource_pattern}}",
+        cozo_str(&g.role), cozo_str(&action), cozo_str(&resource_pattern)
+    );
+    db.run_script(&script, Default::default())
+        .map_err(|e| PolicyError::Compile(format!("grant insert error: {e}")))?;
+    Ok(())
+}
+
+fn compile_categorize(c: &CategorizeDecl, db: &cozo::DbInstance) -> Result<(), PolicyError> {
+    let script = format!(
+        "?[tool_name, category] <- [[{}, {}]]\n\
+         :put tool_category {{tool_name, category}}",
+        cozo_str(&c.tool), cozo_str(&c.category)
+    );
+    db.run_script(&script, Default::default())
+        .map_err(|e| PolicyError::Compile(format!("categorize insert error: {e}")))?;
+    Ok(())
+}
+
+fn compile_classify(c: &ClassifyDecl, db: &cozo::DbInstance) -> Result<(), PolicyError> {
+    let script = format!(
+        "?[uri_pattern, level] <- [[{}, {}]]\n\
+         :put resource_sensitivity {{uri_pattern, level}}",
+        cozo_str(&c.resource_pattern), cozo_str(&c.sensitivity)
+    );
+    db.run_script(&script, Default::default())
+        .map_err(|e| PolicyError::Compile(format!("classify insert error: {e}")))?;
+    Ok(())
+}
+
+// ── Decision script generation ────────────────────────────────────────────────
+
+/// The fixed preamble that binds all request fact types from `$params`.
+/// The evaluator's `facts_loader.rs` is responsible for populating these params.
+/// `$matched_values` is populated by `builtins.rs` before the script runs.
+/// Preamble section of the decision script: binds all spec-defined request fact types
+/// from CozoDB `$params`. The evaluator's `facts_loader.rs` builds the
+/// `BTreeMap<String, DataValue>` for these keys. `$matched_values` is populated
+/// by `builtins.rs` before the script runs. Every key listed here must be supplied
+/// by the evaluator even if empty, so that the script's inline rules can reference
+/// any of them safely.
+const REQUEST_FACT_BINDINGS: &str = "\
+tool_call[call_id, agent_id, tool_name] <- $tool_calls\n\
+agent[agent_id, display_name] <- $agents\n\
+agent_role[agent_id, role] <- $agent_roles\n\
+agent_clearance[agent_id, clearance] <- $agent_clearances\n\
+delegated_by[agent_id, delegator_id] <- $delegations\n\
+user[user_id, agent_id] <- $users\n\
+call_arg[call_id, key, value] <- $call_args\n\
+tool_result[call_id, key, value] <- $tool_results\n\
+resource_access[call_id, res_agent_id, uri, op] <- $resource_accesses\n\
+resource_mime[call_id, mime_type] <- $resource_mimes\n\
+content_tag[call_id, tag, tag_value] <- $content_tags\n\
+timestamp[call_id, unix_ts] <- $timestamps\n\
+call_count[agent_id, tool_name, window, count] <- $call_counts\n\
+environment[key, value] <- $environment\n\
+matched_value[value, pattern_name] <- $matched_values\n";
+
+fn build_decision_script(file: &PolicyFile) -> Result<String, PolicyError> {
+    let mut parts: Vec<String> = vec![REQUEST_FACT_BINDINGS.to_string()];
+
+    // Inline rule definitions from DSL `rule` declarations
+    for decl in &file.declarations {
+        if let Declaration::Rule(r) = decl {
+            parts.extend(compile_rule_to_cozo(r)?);
+        }
+    }
+
+    // Policy blocks — sorted highest priority first
+    let mut policies: Vec<&PolicyDecl> = file.declarations.iter()
+        .filter_map(|d| if let Declaration::Policy(p) = d { Some(p) } else { None })
+        .collect();
+    policies.sort_by(|a, b| b.priority.cmp(&a.priority));
+
+    let mut higher_block_names: Vec<&str> = Vec::new();
+    for policy in &policies {
+        parts.extend(compile_policy_block(policy, &higher_block_names)?);
+        higher_block_names.push(&policy.name);
+    }
+
+    // Named union rule collects output from all policy blocks.
+    // Using a named intermediate rule (rather than multiple `?[...]` heads)
+    // is unambiguous in CozoDB and avoids relying on multi-head `?[...]` union semantics.
+    // Due to stratified negation, at most one block fires per call_id.
+    for policy in &policies {
+        let safe = sanitize_name(&policy.name);
+        parts.push(format!(
+            "decision_output[call_id, verdict, reason, effects_json, block_name] := \
+             b_{safe}_decision[call_id, verdict, reason, effects_json], block_name = {}",
+            cozo_str(&policy.name)
+        ));
+    }
+    // The final query outputs 4 columns: verdict, reason, effects_json, block_name.
+    // `call_id` is intentionally dropped from the output — the evaluator (Chunk 5)
+    // already holds `call_id` from the `FactPackage` and does not need it echoed back.
+    // `block_name` becomes `AuditRecord.matched_rules`. `effects_json` is a JSON
+    // string the evaluator parses back to `Vec<Effect>`.
+    parts.push(
+        "?[verdict, reason, effects_json, block_name] := \
+         decision_output[_, verdict, reason, effects_json, block_name]"
+            .to_string(),
+    );
+
+    Ok(parts.join("\n"))
+}
+
+/// Turn policy name "content-safety" into a valid Cozo identifier segment "content_safety".
+fn sanitize_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
+}
+
+/// Compile a `RuleDecl` to one or more Cozo rule strings.
+/// `Or` conditions are expanded: each arm becomes a separate rule with the same head.
+fn compile_rule_to_cozo(r: &RuleDecl) -> Result<Vec<String>, PolicyError> {
+    let params: Vec<String> = r.params.iter().map(compile_param_str).collect();
+    let head = format!("{}[{}]", r.name, params.join(", "));
+
+    let non_or: Vec<&ConditionClause> = r.conditions.iter()
+        .filter(|c| !matches!(c, ConditionClause::Or(_)))
+        .collect();
+    let or_groups: Vec<&Vec<AtomCondition>> = r.conditions.iter()
+        .filter_map(|c| if let ConditionClause::Or(atoms) = c { Some(atoms) } else { None })
+        .collect();
+
+    let base_body: Vec<String> = non_or.iter()
+        .map(|c| compile_condition_str(c))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if or_groups.is_empty() {
+        // Simple case — no Or conditions
+        let rule = if base_body.is_empty() {
+            // Unconditional rule (shouldn't appear in normal DSL, but safe)
+            format!("{head} := true")
+        } else {
+            format!("{head} := {}", base_body.join(", "))
+        };
+        Ok(vec![rule])
+    } else {
+        // Validation ensures at most one Or group per rule (checked in validate()).
+        // Expand the single Or group: one rule per arm, each sharing the non-Or body.
+        // Multiple rules with the same head are valid CozoDB — they produce a union.
+        let or_atoms = or_groups[0];
+        if or_atoms.is_empty() {
+            return Err(PolicyError::Compile(format!(
+                "rule `{}` has an empty Or group — this is a parser bug or an invalid AST",
+                r.name
+            )));
+        }
+        let rules = or_atoms.iter().map(|atom| {
+            let mut body = base_body.clone();
+            body.push(compile_atom_str(atom));
+            format!("{head} := {}", body.join(", "))
+        }).collect();
+        Ok(rules)
+    }
+}
+
+/// Compile one policy block into Cozo rule strings.
+///
+/// For block "pii-handling" at priority 150, with "content-safety" already matched
+/// at priority 200, generates rules like:
+///
+/// ```
+/// b_pii_handling_deny_1[call_id, reason, effects] :=
+///     <deny conditions>, not b_content_safety_matched[call_id], reason = "...", effects = "..."
+/// b_pii_handling_allow_0[call_id, reason, effects] :=
+///     <allow conditions>, not b_content_safety_matched[call_id], reason = "", effects = "..."
+/// b_pii_handling_decision[call_id, "Deny", reason, effects] :=
+///     b_pii_handling_deny_1[call_id, reason, effects]
+/// b_pii_handling_decision[call_id, "Allow", reason, effects] :=
+///     b_pii_handling_allow_0[call_id, reason, effects],
+///     not b_pii_handling_deny_1[call_id, _, _]
+/// b_pii_handling_matched[call_id] := b_pii_handling_decision[call_id, _, _, _]
+/// ```
+fn compile_policy_block(policy: &PolicyDecl, higher_blocks: &[&str]) -> Result<Vec<String>, PolicyError> {
+    let safe = sanitize_name(&policy.name);
+
+    // The stratified-negation guards that prevent this block from firing
+    // when a higher-priority block already matched.
+    let higher_guards: Vec<String> = higher_blocks.iter()
+        .map(|name| format!("not b_{}_matched[call_id]", sanitize_name(name)))
+        .collect();
+    let higher_guard_suffix = if higher_guards.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", higher_guards.join(", "))
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut deny_rule_names: Vec<String> = Vec::new();
+    let mut allow_rule_names: Vec<String> = Vec::new();
+
+    for (idx, rule) in policy.rules.iter().enumerate() {
+        match rule {
+            PolicyRule::Allow(allow) => {
+                let rule_name = format!("b_{safe}_allow_{idx}");
+                let effects_json = compile_effects_json(&allow.effects);
+                let body = compile_conditions_str(&allow.conditions)?;
+                lines.push(format!(
+                    r#"{rule_name}[call_id, reason, effects] := {body}{higher_guard_suffix}, reason = "", effects = {}"#,
+                    cozo_str(&effects_json)
+                ));
+                allow_rule_names.push(rule_name);
+            }
+            PolicyRule::Deny(deny) => {
+                let rule_name = format!("b_{safe}_deny_{idx}");
+                let effects_json = compile_effects_json(&deny.effects);
+                let reason = deny.reason.as_deref().unwrap_or("");
+                let body = compile_conditions_str(&deny.conditions)?;
+                lines.push(format!(
+                    "{rule_name}[call_id, reason, effects] := {body}{higher_guard_suffix}, reason = {}, effects = {}",
+                    cozo_str(reason),
+                    cozo_str(&effects_json)
+                ));
+                deny_rule_names.push(rule_name);
+            }
+        }
+    }
+
+    // Decision rules: Deny beats Allow at equal priority
+    for deny_rule in &deny_rule_names {
+        lines.push(format!(
+            r#"b_{safe}_decision[call_id, "Deny", reason, effects] := {deny_rule}[call_id, reason, effects]"#
+        ));
+    }
+    for allow_rule in &allow_rule_names {
+        let not_deny: Vec<String> = deny_rule_names.iter()
+            .map(|dr| format!("not {dr}[call_id, _, _]"))
+            .collect();
+        let deny_guard = if not_deny.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", not_deny.join(", "))
+        };
+        lines.push(format!(
+            r#"b_{safe}_decision[call_id, "Allow", reason, effects] := {allow_rule}[call_id, reason, effects]{deny_guard}"#
+        ));
+    }
+
+    // Matched marker for stratification by lower-priority blocks
+    lines.push(format!(
+        "b_{safe}_matched[call_id] := b_{safe}_decision[call_id, _, _, _]"
+    ));
+
+    Ok(lines)
+}
+
+// ── Condition/atom compilation ────────────────────────────────────────────────
+
+/// Compile a condition list to a comma-joined body string.
+/// `ConditionClause::True` is compiled as `tool_call[call_id, _, _]` to bind `call_id`.
+/// `ConditionClause::Or` is rejected — it must be expanded at the rule level; its
+/// presence here indicates a bug or a missing validation step.
+fn compile_conditions_str(conditions: &[ConditionClause]) -> Result<String, PolicyError> {
+    if conditions.is_empty()
+        || (conditions.len() == 1 && conditions[0] == ConditionClause::True)
+    {
+        return Ok("tool_call[call_id, _, _]".to_string());
+    }
+    let parts: Vec<String> = conditions.iter()
+        .map(compile_condition_str)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(parts.join(", "))
+}
+
+fn compile_condition_str(cond: &ConditionClause) -> Result<String, PolicyError> {
+    match cond {
+        ConditionClause::Atom(atom) => Ok(compile_atom_str(atom)),
+        ConditionClause::Not(atom) => Ok(format!("not {}", compile_atom_str(atom))),
+        ConditionClause::True => Ok("tool_call[call_id, _, _]".to_string()),
+        ConditionClause::Or(_) => Err(PolicyError::Compile(
+            "Or conditions are not supported in policy blocks; \
+             use a `rule` declaration to express the Or logic, then reference the rule here"
+                .to_string()
+        )),
+    }
+}
+
+/// Compile an `AtomCondition` to a Cozo condition string.
+/// - `matches(value, :pattern)` → `matched_value[value, "pattern"]`
+/// - Stored relation predicates → `*predicate[args...]`
+/// - Request fact and inline rule predicates → `predicate[args...]`
+fn compile_atom_str(atom: &AtomCondition) -> String {
+    if atom.predicate == "matches" {
+        if let (Some(value_arg), Some(Arg::PatternRef(name))) =
+            (atom.args.first(), atom.args.get(1))
+        {
+            return format!("matched_value[{}, {}]", compile_arg_str(value_arg), cozo_str(name));
+        }
+    }
+    let prefix = if STORED_RELATIONS.contains(&atom.predicate.as_str()) { "*" } else { "" };
+    let args: Vec<String> = atom.args.iter().map(compile_arg_str).collect();
+    format!("{prefix}{}[{}]", atom.predicate, args.join(", "))
+}
+
+fn compile_arg_str(arg: &Arg) -> String {
+    match arg {
+        Arg::Variable(name)      => name.clone(),
+        Arg::Wildcard            => "_".to_string(),
+        Arg::NamedWildcard(name) => format!("_{name}"),
+        Arg::StringLit(s)        => cozo_str(s),
+        Arg::Integer(n)          => n.to_string(),
+        Arg::PatternRef(name)    => cozo_str(name), // fallback; matches() should be caught first
+    }
+}
+
+fn compile_param_str(param: &Param) -> String {
+    match param {
+        Param::Named(name)       => name.clone(),
+        Param::Wildcard          => "_".to_string(),
+        Param::NamedWildcard(n)  => format!("_{n}"),
+    }
+}
+
+// ── Effects serialization ─────────────────────────────────────────────────────
+
+/// Serialize a list of `EffectDecl` to a JSON string embedded in the Cozo script.
+/// The evaluator parses this string back to `Vec<Effect>` after reading the query output.
+fn compile_effects_json(effects: &[EffectDecl]) -> String {
+    if effects.is_empty() {
+        return "[]".to_string();
+    }
+    let items: Vec<serde_json::Value> = effects.iter().map(effect_to_json).collect();
+    // serde_json::to_string on a Vec<Value> built entirely from json!() literals is infallible.
+    // Using expect() (not unwrap_or_else) so that any impossible failure is loud, not silent.
+    // Silent fallback to "[]" would drop effects from decisions without any error signal,
+    // violating the spec's "errors are never silently swallowed" invariant.
+    serde_json::to_string(&items).expect("effects serialization cannot fail: all values are JSON literals")
+}
+
+fn effect_to_json(e: &EffectDecl) -> serde_json::Value {
+    match e {
+        EffectDecl::Redact { selector, classifier } => serde_json::json!({
+            "type": "Redact", "selector": selector, "classifier": classifier
+        }),
+        EffectDecl::Mask { selector, pattern, replacement } => serde_json::json!({
+            "type": "Mask", "selector": selector, "pattern": pattern, "replacement": replacement
+        }),
+        EffectDecl::Annotate { key, value } => serde_json::json!({
+            "type": "Annotate", "key": key, "value": value
+        }),
+        EffectDecl::Audit { level } => serde_json::json!({
+            "type": "Audit",
+            "level": match level {
+                AuditLevelDecl::Standard  => "Standard",
+                AuditLevelDecl::Elevated  => "Elevated",
+                AuditLevelDecl::Critical  => "Critical",
+            }
+        }),
+    }
+}
+
+// ── CozoDB string literal helper ──────────────────────────────────────────────
+
+/// Wrap a string as a CozoDB string literal (JSON-compatible).
+/// Escapes backslashes and double-quotes.
+fn cozo_str(s: &str) -> String {
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+```
+
+- [ ] **Step 8: Run all compiler tests to verify they pass**
+
+```bash
+cargo test --lib dsl::compiler
+```
+
+Expected: all 7 unit tests pass.
+
+> **Debugging notes for implementer:**
+> - If a `compile_grant_stored_in_cozo` or similar test fails with "relation not found", verify that `init_db` runs the `:create` scripts before any `:put` scripts.
+> - If `compile_decision_script_no_syntax_error` fails, `unwrap_or_else` will print the full decision_script. Inspect the generated Cozo — common issues: double `*` prefix on inline rule names, unquoted string literals, wrong bracket type (`()` vs `[]`).
+> - **`run_script` arity:** All `run_script` calls in this chunk use `(script, params)` — the same 2-arg form established and approved in Chunk 2, Task 6 (`cozo_mem_instance_runs_trivial_query`). If the version of cozo in `Cargo.toml` has a 3-arg form including `ScriptMutability`, add `cozo::ScriptMutability::Mutable` as the third argument on every `:put` and `:create` call and `cozo::ScriptMutability::Immutable` on every query-only call. Run `cargo doc -p cozo --open` to check the actual signature.
+> - **`DbInstance::new` signature:** May differ by patch version — see note in Chunk 2, Task 6. If it doesn't accept a `serde_json::Value` third arg, try `cozo::new_cozo_mem()`.
+> - The `result.rows` field on `cozo::NamedRows` may be named differently — check the cozo crate docs for the correct field name if `result.rows` doesn't compile.
+
+- [ ] **Step 9: Run the integration tests**
+
+```bash
+cargo test --test dsl_tests
+```
+
+Expected: all previously passing tests still pass; new `compile_error_*` tests pass.
+`tests/dsl_tests.rs` total: 16 tests (12 parser tests from Chunk 3 + 4 `compile_error_*` tests).
+The 8 unit tests in `src/dsl/compiler.rs` run separately under `cargo test --lib dsl::compiler` and are not counted here.
+
+- [ ] **Step 10: Run full test suite**
+
+```bash
+cargo test
+```
+
+Expected: all tests pass; no regressions from Chunks 1–3.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add src/dsl/compiler.rs src/dsl/mod.rs src/lib.rs tests/dsl_tests.rs
+git commit -m "feat: add DSL compiler (AST → CompiledPolicy)"
+```
