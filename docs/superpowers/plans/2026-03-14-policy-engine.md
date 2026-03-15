@@ -3116,3 +3116,954 @@ Expected: all tests pass; no regressions from Chunks 1–3.
 git add src/dsl/compiler.rs src/dsl/mod.rs src/lib.rs tests/dsl_tests.rs
 git commit -m "feat: add DSL compiler (AST → CompiledPolicy)"
 ```
+
+---
+
+## Chunk 5: Evaluator
+
+**Covers:** `src/evaluator/facts_loader.rs`, `src/evaluator/builtins.rs`, `src/evaluator/engine.rs`, `src/evaluator/mod.rs`, `src/lib.rs` (add `Engine` re-export)
+
+**Goal:** The evaluation engine that turns `FactPackage + PolicyStore → Decision`. `facts_loader.rs` serializes request facts to CozoDB params. `builtins.rs` runs the regex pre-pass that resolves `matches()` calls. `engine.rs` holds the core `evaluate_inner()` logic. `mod.rs` provides the public `Engine` struct with its fail-closed `evaluate()` and `PolicyWatcher` implementation.
+
+---
+
+### Task 13: `src/evaluator/facts_loader.rs`
+
+**Files:**
+- Create: `src/evaluator/facts_loader.rs`
+- Modify: `src/evaluator/mod.rs` (wire submodules)
+
+The facts loader converts a `FactPackage` into the `BTreeMap<String, DataValue>` that CozoDB's `run_script` expects. Each map key matches a `$param_name` in the `REQUEST_FACT_BINDINGS` preamble compiled into the decision script (see `src/dsl/compiler.rs`).
+
+- [ ] **Step 1: Update `src/evaluator/mod.rs`**
+
+Replace the stub content with:
+
+```rust
+// src/evaluator/mod.rs
+mod builtins;
+pub(super) mod engine;
+mod facts_loader;
+```
+
+The full `Engine` public API will be added in Task 15. This stub wires all three submodules so they compile together.
+
+- [ ] **Step 2: Write the failing tests**
+
+Add to `src/evaluator/facts_loader.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::facts::*;
+    use crate::types::*;
+
+    #[test]
+    fn all_fifteen_params_present_even_with_empty_facts() {
+        let params = load_facts(&FactPackage::default(), vec![]);
+        // These 15 keys match the $param placeholders in REQUEST_FACT_BINDINGS
+        // in src/dsl/compiler.rs. Adding a fact type there requires adding it here.
+        let expected_keys = [
+            "agents", "agent_roles", "agent_clearances", "delegations", "users",
+            "tool_calls", "call_args", "tool_results", "resource_accesses", "resource_mimes",
+            "content_tags", "timestamps", "call_counts", "environment", "matched_values",
+        ];
+        for key in &expected_keys {
+            assert!(params.contains_key(*key), "missing CozoDB param: {key}");
+        }
+        assert_eq!(params.len(), 15);
+    }
+
+    #[test]
+    fn tool_call_converts_to_list_of_lists() {
+        let pkg = FactPackage {
+            tool_calls: vec![ToolCallFact {
+                call_id: CallId("call-1".to_string()),
+                agent_id: AgentId("agt-1".to_string()),
+                tool_name: ToolName("db_query".to_string()),
+            }],
+            ..Default::default()
+        };
+        let params = load_facts(&pkg, vec![]);
+        let rows = match &params["tool_calls"] {
+            cozo::DataValue::List(rows) => rows,
+            other => panic!("expected List, got {:?}", other),
+        };
+        assert_eq!(rows.len(), 1);
+        let row = match &rows[0] {
+            cozo::DataValue::List(row) => row,
+            other => panic!("expected List row, got {:?}", other),
+        };
+        // schema: [call_id, agent_id, tool_name]
+        assert_eq!(row.len(), 3);
+        assert_eq!(row[0], cozo::DataValue::Str("call-1".into()));
+        assert_eq!(row[1], cozo::DataValue::Str("agt-1".into()));
+        assert_eq!(row[2], cozo::DataValue::Str("db_query".into()));
+    }
+
+    #[test]
+    fn timestamp_unix_ts_converts_to_numeric_not_string() {
+        let mut pkg = FactPackage::default();
+        pkg.timestamps.push(TimestampFact {
+            call_id: CallId("call-1".to_string()),
+            unix_ts: 1_700_000_000,
+        });
+        let params = load_facts(&pkg, vec![]);
+        let rows = match &params["timestamps"] {
+            cozo::DataValue::List(rows) => rows,
+            other => panic!("expected List, got {:?}", other),
+        };
+        let row = match &rows[0] {
+            cozo::DataValue::List(row) => row,
+            other => panic!("expected List row, got {:?}", other),
+        };
+        // row schema: [call_id, unix_ts] — unix_ts must be Num, not Str
+        assert!(
+            matches!(row[1], cozo::DataValue::Num(_)),
+            "unix_ts must be DataValue::Num, got {:?}", row[1]
+        );
+    }
+
+    #[test]
+    fn matched_values_converts_to_list_of_string_pairs() {
+        let pairs = vec![
+            ("DROP TABLE users".to_string(), "sql_injection".to_string()),
+        ];
+        let params = load_facts(&FactPackage::default(), pairs);
+        let rows = match &params["matched_values"] {
+            cozo::DataValue::List(rows) => rows,
+            other => panic!("expected List, got {:?}", other),
+        };
+        assert_eq!(rows.len(), 1);
+        let pair = match &rows[0] {
+            cozo::DataValue::List(pair) => pair,
+            other => panic!("expected List pair, got {:?}", other),
+        };
+        // schema: [value, pattern_name]
+        assert_eq!(pair.len(), 2);
+        assert_eq!(pair[0], cozo::DataValue::Str("DROP TABLE users".into()));
+        assert_eq!(pair[1], cozo::DataValue::Str("sql_injection".into()));
+    }
+}
+```
+
+- [ ] **Step 3: Run to verify failure**
+
+```bash
+cargo test --lib evaluator::facts_loader
+```
+
+Expected: compile error — `load_facts` not defined.
+
+- [ ] **Step 4: Implement `src/evaluator/facts_loader.rs`**
+
+```rust
+// src/evaluator/facts_loader.rs
+use std::collections::BTreeMap;
+use cozo::DataValue;
+use crate::facts::*;
+
+/// Convert a `FactPackage` to CozoDB script parameters.
+///
+/// Returns a `BTreeMap<String, DataValue>` where each key matches a `$param_name`
+/// in the compiled decision script's REQUEST_FACT_BINDINGS preamble. All 15 keys
+/// are always present; empty fact lists produce `DataValue::List(vec![])`.
+///
+/// `matched_values` is the output of the builtins pre-pass (pairs of
+/// `(value_string, pattern_name)` where the regex matched).
+pub(super) fn load_facts(
+    facts: &FactPackage,
+    matched_values: Vec<(String, String)>,
+) -> BTreeMap<String, DataValue> {
+    let mut p = BTreeMap::new();
+
+    // Identity
+    p.insert("agents".to_string(),
+        rows(facts.agents.iter().map(|f| vec![s(&f.id.0), s(&f.display_name)])));
+    p.insert("agent_roles".to_string(),
+        rows(facts.agent_roles.iter().map(|f| vec![s(&f.agent_id.0), s(&f.role.0)])));
+    p.insert("agent_clearances".to_string(),
+        rows(facts.agent_clearances.iter().map(|f| vec![s(&f.agent_id.0), s(&f.clearance)])));
+    p.insert("delegations".to_string(),
+        rows(facts.delegations.iter().map(|f| vec![s(&f.agent_id.0), s(&f.delegator_id.0)])));
+    p.insert("users".to_string(),
+        rows(facts.users.iter().map(|f| vec![s(&f.user_id), s(&f.agent_id.0)])));
+
+    // MCP call
+    p.insert("tool_calls".to_string(),
+        rows(facts.tool_calls.iter().map(|f| {
+            vec![s(&f.call_id.0), s(&f.agent_id.0), s(&f.tool_name.0)]
+        })));
+    p.insert("call_args".to_string(),
+        rows(facts.call_args.iter().map(|f| vec![s(&f.call_id.0), s(&f.key), s(&f.value)])));
+    p.insert("tool_results".to_string(),
+        rows(facts.tool_results.iter().map(|f| vec![s(&f.call_id.0), s(&f.key), s(&f.value)])));
+    p.insert("resource_accesses".to_string(),
+        rows(facts.resource_accesses.iter().map(|f| {
+            vec![s(&f.call_id.0), s(&f.agent_id.0), s(&f.uri.0), s(f.op.as_str())]
+        })));
+    p.insert("resource_mimes".to_string(),
+        rows(facts.resource_mimes.iter().map(|f| vec![s(&f.call_id.0), s(&f.mime_type)])));
+
+    // Content classification
+    p.insert("content_tags".to_string(),
+        rows(facts.content_tags.iter().map(|f| vec![s(&f.call_id.0), s(&f.tag), s(&f.value)])));
+
+    // Environment
+    p.insert("timestamps".to_string(),
+        rows(facts.timestamps.iter().map(|f| vec![s(&f.call_id.0), n(f.unix_ts)])));
+    p.insert("call_counts".to_string(),
+        rows(facts.call_counts.iter().map(|f| {
+            vec![s(&f.agent_id.0), s(&f.tool_name.0), s(&f.window), n(f.count)]
+        })));
+    p.insert("environment".to_string(),
+        rows(facts.environment.iter().map(|f| vec![s(&f.key), s(&f.value)])));
+
+    // Builtins pre-pass: matched_value pairs from regex evaluation
+    p.insert("matched_values".to_string(),
+        rows(matched_values.iter().map(|(val, name)| vec![s(val), s(name)])));
+
+    p
+}
+
+// ── DataValue constructors ────────────────────────────────────────────────────
+
+/// `&str` → `DataValue::Str`.
+/// `SmartString` (cozo's internal string type) implements `From<&str>`,
+/// so `.into()` is the idiomatic conversion.
+fn s(v: &str) -> DataValue {
+    DataValue::Str(v.into())
+}
+
+/// `u64` → `DataValue::Num(cozo::Num::Int(n))`.
+/// Timestamps and call counts are stored as signed 64-bit integers in CozoDB.
+fn n(v: u64) -> DataValue {
+    DataValue::Num(cozo::Num::Int(v as i64))
+}
+
+/// Build a `DataValue::List` of rows from an iterator of column-value vectors.
+/// Each inner `vec![col0, col1, ...]` becomes a `DataValue::List` row.
+fn rows(iter: impl Iterator<Item = Vec<DataValue>>) -> DataValue {
+    DataValue::List(iter.map(DataValue::List).collect())
+}
+```
+
+> **Note for implementer:**
+> - If `DataValue::Str(v.into())` doesn't compile, `SmartString` may need an explicit import: `use smartstring::SmartString;` then `DataValue::Str(SmartString::from(v))`. Run `cargo doc -p cozo --open` to see the exact variant type.
+> - If `cozo::Num` is not in scope, try `use cozo::Num;`. If `Num` isn't re-exported at the crate root, check the cozo docs for the full path (e.g. `cozo::data::value::Num`).
+> - `BTreeMap` is the established param type from prior chunks. If the cozo version you have expects `HashMap`, check `cargo doc -p cozo --open` for the `run_script` signature and adjust accordingly.
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+```bash
+cargo test --lib evaluator::facts_loader
+```
+
+Expected: all 4 tests pass.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/evaluator/facts_loader.rs src/evaluator/mod.rs
+git commit -m "feat: add facts_loader (FactPackage → CozoDB params)"
+```
+
+---
+
+### Task 14: `src/evaluator/builtins.rs`
+
+**Files:**
+- Create: `src/evaluator/builtins.rs`
+
+The builtins pre-pass resolves `matches(value, :pattern)` calls before the CozoDB query runs. It collects all string values from the `FactPackage` that could flow into a `matches()` expression, tests each against each compiled `Regex`, and returns matching `(value, pattern_name)` pairs. These pairs populate `$matched_values` in the decision script, making `matched_value[value, "pattern_name"]` true in the Datalog query.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to `src/evaluator/builtins.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use regex::Regex;
+    use crate::facts::{CallArgFact, FactPackage, ToolResultFact};
+    use crate::types::CallId;
+
+    fn pats(pairs: &[(&str, &str)]) -> HashMap<String, Regex> {
+        pairs.iter()
+            .map(|(name, pat)| (name.to_string(), Regex::new(pat).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn no_patterns_returns_empty_without_inspecting_facts() {
+        // Short-circuit: if there are no patterns, result is always empty
+        // regardless of FactPackage contents.
+        let mut facts = FactPackage::default();
+        facts.call_args.push(CallArgFact {
+            call_id: CallId("c".to_string()),
+            key: "q".to_string(),
+            value: "DROP TABLE users".to_string(),
+        });
+        let result = compute_matched_values(&facts, &HashMap::new());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn no_string_values_returns_empty() {
+        // Empty FactPackage has no call_args, tool_results, etc.
+        let facts = FactPackage::default();
+        let p = pats(&[("sql_injection", r"(?i)(drop|delete)\s+table")]);
+        let result = compute_matched_values(&facts, &p);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn matching_call_arg_value_returns_pair() {
+        let mut facts = FactPackage::default();
+        facts.call_args.push(CallArgFact {
+            call_id: CallId("c".to_string()),
+            key: "query".to_string(),
+            value: "DROP TABLE users".to_string(),
+        });
+        let p = pats(&[("sql_injection", r"(?i)(drop|delete)\s+table")]);
+        let result = compute_matched_values(&facts, &p);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "DROP TABLE users");
+        assert_eq!(result[0].1, "sql_injection");
+    }
+
+    #[test]
+    fn non_matching_value_is_excluded() {
+        let mut facts = FactPackage::default();
+        facts.call_args.push(CallArgFact {
+            call_id: CallId("c".to_string()),
+            key: "query".to_string(),
+            value: "SELECT * FROM users".to_string(), // safe query
+        });
+        let p = pats(&[("sql_injection", r"(?i)(drop|delete)\s+table")]);
+        let result = compute_matched_values(&facts, &p);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn tool_result_value_is_tested() {
+        let mut facts = FactPackage::default();
+        facts.tool_results.push(ToolResultFact {
+            call_id: CallId("c".to_string()),
+            key: "content".to_string(),
+            value: "sk-abc123def456ghi789jkl012mno345pqr678stu901".to_string(),
+        });
+        let p = pats(&[("secret_key", r"sk-[a-zA-Z0-9]{32,}")]);
+        let result = compute_matched_values(&facts, &p);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].1, "secret_key");
+    }
+}
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+```bash
+cargo test --lib evaluator::builtins
+```
+
+Expected: compile error — `compute_matched_values` not defined.
+
+- [ ] **Step 3: Implement `src/evaluator/builtins.rs`**
+
+```rust
+// src/evaluator/builtins.rs
+use std::collections::HashMap;
+use regex::Regex;
+use crate::facts::FactPackage;
+
+/// Run the regex pre-pass over the `FactPackage`.
+///
+/// Tests every string value that could flow into a `matches(value, :pattern)`
+/// DSL expression against each compiled `Regex`. Returns `(value, pattern_name)`
+/// pairs where the regex matched.
+///
+/// The result becomes the `$matched_values` CozoDB parameter, populating the
+/// `matched_value[value, pattern_name]` relation that `matches()` rewrites to.
+///
+/// Tested value sources (conservative superset of what DSL rules typically use):
+/// - `call_args.value`    — most common target (e.g. checking args for SQL injection)
+/// - `tool_results.value` — for response-time policies (e.g. detecting secret keys)
+/// - `content_tags.value` — tag values from external classifiers
+/// - `environment.value`  — deployment environment variable values
+///
+/// If `patterns` is empty, returns `vec![]` without inspecting the FactPackage.
+pub(super) fn compute_matched_values(
+    facts: &FactPackage,
+    patterns: &HashMap<String, Regex>,
+) -> Vec<(String, String)> {
+    if patterns.is_empty() {
+        return Vec::new();
+    }
+
+    let values = collect_string_values(facts);
+    let mut matched = Vec::new();
+
+    for value in &values {
+        for (name, regex) in patterns {
+            if regex.is_match(value) {
+                matched.push((value.clone(), name.clone()));
+            }
+        }
+    }
+
+    matched
+}
+
+/// Collect all string values that are candidates for pattern matching.
+/// Returns a sorted, deduplicated list.
+fn collect_string_values(facts: &FactPackage) -> Vec<String> {
+    let mut values: Vec<String> = Vec::new();
+    for f in &facts.call_args    { values.push(f.value.clone()); }
+    for f in &facts.tool_results { values.push(f.value.clone()); }
+    for f in &facts.content_tags { values.push(f.value.clone()); }
+    for f in &facts.environment  { values.push(f.value.clone()); }
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+```bash
+cargo test --lib evaluator::builtins
+```
+
+Expected: all 5 tests pass.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/evaluator/builtins.rs
+git commit -m "feat: add builtins regex pre-pass (compute_matched_values)"
+```
+
+---
+
+### Task 15: `src/evaluator/engine.rs`, `src/evaluator/mod.rs`, `src/lib.rs`
+
+**Files:**
+- Create: `src/evaluator/engine.rs`
+- Modify: `src/evaluator/mod.rs` (add `Engine` struct, `PolicyWatcher` impl, tests)
+- Modify: `src/lib.rs` (add `pub use evaluator::Engine;`)
+
+`engine.rs` contains `evaluate_inner()`: acquires the read lock, runs builtins pre-pass, builds CozoDB params, executes the decision script, maps rows to a `Decision`. `mod.rs` wraps it in the public `Engine` struct with fail-closed `evaluate()` and `PolicyWatcher` implementation.
+
+- [ ] **Step 1: Write the failing tests**
+
+Replace `src/evaluator/mod.rs` with:
+
+```rust
+// src/evaluator/mod.rs
+mod builtins;
+pub(super) mod engine;
+mod facts_loader;
+
+use crate::decision::{AuditLevel, AuditRecord, Decision, Effect, Verdict};
+use crate::error::PolicyError;
+use crate::facts::FactPackage;
+use crate::policy::store::PolicyStore;
+use crate::policy::watcher::{PolicySet, PolicyWatcher};
+
+/// The authorization engine. Owns a `PolicyStore` and implements `PolicyWatcher`.
+///
+/// Cheap to clone — all clones share the same underlying `PolicyStore`.
+/// Create one per process; clone handles to share across threads.
+#[derive(Clone)]
+pub struct Engine {
+    store: PolicyStore,
+}
+
+impl Engine {
+    pub fn new() -> Self {
+        Self { store: PolicyStore::new() }
+    }
+
+    /// Evaluate a `FactPackage` against the loaded policy.
+    ///
+    /// Never panics, never fails open. If any error occurs — store uninitialized,
+    /// CozoDB error, malformed facts — returns `Deny + Audit(Critical)`.
+    pub fn evaluate(&self, facts: &FactPackage) -> Decision {
+        engine::evaluate_inner(facts, &self.store)
+            .unwrap_or_else(|err| Decision {
+                verdict: Verdict::Deny,
+                effects: vec![Effect::Audit {
+                    level: AuditLevel::Critical,
+                    message: Some(err.to_string()),
+                }],
+                reason: Some("evaluation error".to_string()),
+                audit: AuditRecord::from_error(facts, &err),
+            })
+    }
+
+    /// Returns the version string of the currently loaded policy, if any.
+    pub fn current_version(&self) -> Option<String> {
+        self.store.current_version()
+    }
+}
+
+impl Default for Engine {
+    fn default() -> Self { Self::new() }
+}
+
+impl PolicyWatcher for Engine {
+    fn push(&self, policy: PolicySet) -> Result<(), PolicyError> {
+        // Idempotency: skip compile+swap if this version is already loaded.
+        if self.store.current_version().as_deref() == Some(&policy.version) {
+            return Ok(());
+        }
+        let compiled = crate::dsl::compiler::compile(&policy.source, &policy.version)?;
+        self.store.swap(compiled);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::facts::{AgentRoleFact, FactPackage, ToolCallFact};
+    use crate::types::{AgentId, CallId, Role, ToolName};
+
+    // ── Test helpers ──────────────────────────────────────────────────────────
+
+    fn one_call() -> FactPackage {
+        FactPackage {
+            tool_calls: vec![ToolCallFact {
+                call_id: CallId("call-1".to_string()),
+                agent_id: AgentId("agt-1".to_string()),
+                tool_name: ToolName("test_tool".to_string()),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn one_call_with_role(role: &str) -> FactPackage {
+        let mut pkg = one_call();
+        pkg.agent_roles.push(AgentRoleFact {
+            agent_id: AgentId("agt-1".to_string()),
+            role: Role(role.to_string()),
+        });
+        pkg
+    }
+
+    fn push_policy(engine: &Engine, version: &str, source: &str) {
+        engine.push(PolicySet {
+            version: version.to_string(),
+            source: source.to_string(),
+            checksum: String::new(),
+        }).expect("test policy must compile");
+    }
+
+    // ── Test policies ─────────────────────────────────────────────────────────
+
+    /// Default-deny: fires on any tool_call, always returns Deny.
+    const DENY_ALL: &str = r#"
+policy "default" priority 100 {
+    deny when true
+        reason "no matching allow rule";
+}
+"#;
+
+    /// Allow when the calling agent has role "tester"; no deny rule in this block.
+    /// A call with agent_role "tester" → Allow.
+    /// A call without that role → no rows from this policy → fail-closed Deny.
+    const ALLOW_TESTER_ROLE: &str = r#"
+policy "default" priority 100 {
+    allow when
+        tool_call(call_id, agent_id, _),
+        agent_role(agent_id, "tester");
+}
+"#;
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn engine_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Engine>();
+    }
+
+    #[test]
+    fn engine_clone_shares_store() {
+        let engine = Engine::new();
+        let clone = engine.clone();
+        push_policy(&engine, "v1", DENY_ALL);
+        // Both handles point to the same store — must see the same version.
+        assert_eq!(engine.current_version(), clone.current_version());
+    }
+
+    #[test]
+    fn evaluate_uninitialized_store_returns_deny_audit_critical() {
+        let engine = Engine::new(); // no push — store holds None
+        let decision = engine.evaluate(&one_call());
+        assert_eq!(decision.verdict, Verdict::Deny);
+        assert!(
+            decision.effects.iter().any(|e| matches!(e,
+                Effect::Audit { level: AuditLevel::Critical, .. }
+            )),
+            "expected Audit(Critical) effect, got: {:?}", decision.effects
+        );
+    }
+
+    #[test]
+    fn push_valid_policy_succeeds() {
+        let engine = Engine::new();
+        let result = engine.push(PolicySet {
+            version: "v1".to_string(),
+            source: DENY_ALL.to_string(),
+            checksum: String::new(),
+        });
+        assert!(result.is_ok());
+        assert_eq!(engine.current_version(), Some("v1".to_string()));
+    }
+
+    #[test]
+    fn push_invalid_policy_leaves_store_unchanged() {
+        let engine = Engine::new();
+        push_policy(&engine, "v1", DENY_ALL);
+        // Push a malformed policy — must fail and leave "v1" still loaded.
+        let result = engine.push(PolicySet {
+            version: "v2".to_string(),
+            source: "this is not valid DSL !!!".to_string(),
+            checksum: String::new(),
+        });
+        assert!(result.is_err(), "invalid policy should return Err");
+        assert_eq!(engine.current_version(), Some("v1".to_string()));
+    }
+
+    #[test]
+    fn push_same_version_is_idempotent() {
+        let engine = Engine::new();
+        push_policy(&engine, "v1", DENY_ALL);
+        // Same version with broken source — idempotency check must fire before compile.
+        let result = engine.push(PolicySet {
+            version: "v1".to_string(),
+            source: "this is not valid DSL !!!".to_string(),
+            checksum: String::new(),
+        });
+        assert!(result.is_ok(), "same version must skip compile and return Ok");
+    }
+
+    #[test]
+    fn evaluate_deny_when_true_returns_deny() {
+        let engine = Engine::new();
+        push_policy(&engine, "v1", DENY_ALL);
+        let decision = engine.evaluate(&one_call());
+        assert_eq!(decision.verdict, Verdict::Deny);
+    }
+
+    #[test]
+    fn evaluate_deny_when_true_populates_reason() {
+        let engine = Engine::new();
+        push_policy(&engine, "v1", DENY_ALL);
+        let decision = engine.evaluate(&one_call());
+        assert_eq!(decision.reason.as_deref(), Some("no matching allow rule"));
+    }
+
+    #[test]
+    fn evaluate_allow_rule_returns_allow() {
+        let engine = Engine::new();
+        push_policy(&engine, "v1", ALLOW_TESTER_ROLE);
+        // Agent has role "tester" → allow rule fires → Allow.
+        let decision = engine.evaluate(&one_call_with_role("tester"));
+        assert_eq!(decision.verdict, Verdict::Allow);
+    }
+
+    #[test]
+    fn evaluate_allow_rule_without_matching_role_returns_deny() {
+        let engine = Engine::new();
+        push_policy(&engine, "v1", ALLOW_TESTER_ROLE);
+        // Agent has no roles → allow rule does not fire → no rows → fail-closed Deny.
+        // This exercises the `parse_decision` "no rows" error path, which is a
+        // critical security property: missing policy match must never produce Allow.
+        let decision = engine.evaluate(&one_call());
+        assert_eq!(decision.verdict, Verdict::Deny);
+        assert!(
+            decision.effects.iter().any(|e| matches!(e,
+                Effect::Audit { level: AuditLevel::Critical, .. }
+            )),
+            "no-match path must produce Audit(Critical), got: {:?}", decision.effects
+        );
+    }
+}
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+```bash
+cargo test --lib evaluator
+```
+
+Expected: compile errors — `engine::evaluate_inner` not defined; `Engine` struct/methods not yet implemented. The test module compiles but all `engine::` calls fail.
+
+- [ ] **Step 3: Implement `src/evaluator/engine.rs`**
+
+```rust
+// src/evaluator/engine.rs
+use cozo::DataValue;
+use crate::decision::{AuditLevel, AuditRecord, Decision, Effect, Verdict};
+use crate::error::EngineError;
+use crate::facts::FactPackage;
+use crate::policy::store::PolicyStore;
+use crate::types::{AgentId, CallId};
+
+/// Core evaluation logic. Acquires a shared read lock on the policy store,
+/// runs the builtins pre-pass, builds CozoDB params, executes the compiled
+/// decision script, and maps the result rows to a `Decision`.
+///
+/// Returns `Err` on any failure — the caller (`Engine::evaluate`) maps every
+/// error to `Deny + Audit(Critical)` without ever failing open.
+pub(super) fn evaluate_inner(
+    facts: &FactPackage,
+    store: &PolicyStore,
+) -> Result<Decision, EngineError> {
+    // Acquire shared read lock. Many requests hold this concurrently with zero
+    // contention. Policy pushes (rare) take the exclusive write lock separately.
+    // The lock is held for the entire duration of this function.
+    let guard = store.read();
+
+    // Fail-closed: no policy loaded yet → immediate Deny.
+    let policy = guard.as_ref().ok_or(EngineError::StoreUninitialized)?;
+
+    // Builtins pre-pass: resolve matches() calls before running the Cozo script.
+    let matched_values = super::builtins::compute_matched_values(facts, &policy.patterns);
+
+    // Build CozoDB script params from the FactPackage + builtins results.
+    let params = super::facts_loader::load_facts(facts, matched_values);
+
+    // Run the compiled decision script against the shared policy DB.
+    let result = policy.db
+        .run_script(&policy.decision_script, params)
+        .map_err(|e| EngineError::Cozo(e.to_string()))?;
+
+    // Map result rows to a Decision.
+    // `policy` borrows from `guard`, so `guard` stays alive through this call.
+    // The read lock is released when `evaluate_inner` returns (not before).
+    parse_decision(result, facts, &policy.version)
+}
+
+/// Map CozoDB result rows to a `Decision`.
+///
+/// Expected output schema (from `?[verdict, reason, effects_json, block_name]`
+/// in the compiled decision script):
+///   - `verdict`:      "Allow" | "Deny"
+///   - `reason`:       reason string, or "" if none
+///   - `effects_json`: JSON-encoded `Vec<Effect>` (e.g. `[]`, `[{"type":"Audit",...}]`)
+///   - `block_name`:   name of the matching policy block (for audit trail)
+fn parse_decision(
+    result: cozo::NamedRows,
+    facts: &FactPackage,
+    policy_version: &str,
+) -> Result<Decision, EngineError> {
+    // No rows means no policy rule matched (policy missing a deny-when-true fallback).
+    // Fail closed: treat as evaluation error → caller maps to Deny.
+    let row = result.rows.first().ok_or_else(|| EngineError::Cozo(
+        "decision script returned no rows — \
+         policy has no rule matching this call (missing deny-when-true fallback?)"
+            .to_string()
+    ))?;
+
+    // Column 0: verdict
+    let verdict_str = match row.first() {
+        Some(DataValue::Str(s)) => s.as_str().to_owned(),
+        other => return Err(EngineError::Cozo(
+            format!("unexpected type for verdict column: {:?}", other)
+        )),
+    };
+    let verdict = match verdict_str.as_str() {
+        "Allow" => Verdict::Allow,
+        "Deny"  => Verdict::Deny,
+        other   => return Err(EngineError::Cozo(
+            format!("unexpected verdict value '{}': expected 'Allow' or 'Deny'", other)
+        )),
+    };
+
+    // Column 1: reason (empty string → None)
+    let reason = match row.get(1) {
+        Some(DataValue::Str(s)) if !s.is_empty() => Some(s.to_string()),
+        _ => None,
+    };
+
+    // Column 2: effects_json
+    let effects = match row.get(2) {
+        Some(DataValue::Str(s)) => parse_effects_json(s.as_str())?,
+        _ => Vec::new(),
+    };
+
+    // Column 3: block_name (the policy block that produced this decision)
+    let block_name = match row.get(3) {
+        Some(DataValue::Str(s)) => s.to_string(),
+        _ => String::new(),
+    };
+
+    // Build AuditRecord from FactPackage context.
+    let (call_id, agent_id, tool_name) = facts.tool_calls.first()
+        .map(|tc| (
+            tc.call_id.clone(),
+            tc.agent_id.clone(),
+            Some(tc.tool_name.0.clone()),
+        ))
+        .unwrap_or_else(|| (
+            CallId("unknown".to_string()),
+            AgentId("unknown".to_string()),
+            None,
+        ));
+
+    let timestamp = facts.timestamps.iter()
+        .find(|t| t.call_id == call_id)
+        .map(|t| t.unix_ts);
+
+    let audit = AuditRecord {
+        call_id,
+        agent_id,
+        tool_name,
+        verdict,
+        policy_version: policy_version.to_string(),
+        matched_rules: if block_name.is_empty() { vec![] } else { vec![block_name] },
+        timestamp,
+    };
+
+    Ok(Decision { verdict, effects, reason, audit })
+}
+
+/// Parse a JSON-encoded effects string back to `Vec<Effect>`.
+fn parse_effects_json(json_str: &str) -> Result<Vec<Effect>, EngineError> {
+    if json_str == "[]" || json_str.is_empty() {
+        return Ok(Vec::new());
+    }
+    let values: Vec<serde_json::Value> = serde_json::from_str(json_str)
+        .map_err(|e| EngineError::Cozo(
+            format!("failed to parse effects JSON '{}': {}", json_str, e)
+        ))?;
+    values.iter().map(json_to_effect).collect()
+}
+
+fn json_to_effect(v: &serde_json::Value) -> Result<Effect, EngineError> {
+    let ty = v["type"].as_str()
+        .ok_or_else(|| EngineError::Cozo("effect missing 'type' field".to_string()))?;
+    match ty {
+        "Redact" => Ok(Effect::Redact {
+            selector:   v["selector"].as_str().unwrap_or("").to_string(),
+            classifier: v["classifier"].as_str().unwrap_or("").to_string(),
+        }),
+        "Mask" => Ok(Effect::Mask {
+            selector:    v["selector"].as_str().unwrap_or("").to_string(),
+            pattern:     v["pattern"].as_str().unwrap_or("").to_string(),
+            replacement: v["replacement"].as_str().unwrap_or("").to_string(),
+        }),
+        "Annotate" => Ok(Effect::Annotate {
+            key:   v["key"].as_str().unwrap_or("").to_string(),
+            value: v["value"].as_str().unwrap_or("").to_string(),
+        }),
+        "Audit" => Ok(Effect::Audit {
+            level: match v["level"].as_str() {
+                Some("Elevated") => AuditLevel::Elevated,
+                Some("Critical") => AuditLevel::Critical,
+                _                => AuditLevel::Standard,
+            },
+            message: v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()),
+        }),
+        other => Err(EngineError::Cozo(format!("unknown effect type: '{}'", other))),
+    }
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::store::PolicyStore;
+    use crate::facts::{FactPackage, ToolCallFact};
+    use crate::types::{AgentId, CallId, ToolName};
+
+    fn one_call() -> FactPackage {
+        FactPackage {
+            tool_calls: vec![ToolCallFact {
+                call_id: CallId("call-1".to_string()),
+                agent_id: AgentId("agt-1".to_string()),
+                tool_name: ToolName("test_tool".to_string()),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn uninitialized_store_returns_store_uninitialized_err() {
+        let store = PolicyStore::new(); // no swap — holds None
+        let result = evaluate_inner(&one_call(), &store);
+        assert!(
+            matches!(result, Err(EngineError::StoreUninitialized)),
+            "expected StoreUninitialized, got: {:?}", result
+        );
+    }
+
+    #[test]
+    fn deny_all_policy_returns_deny_decision() {
+        let store = PolicyStore::new();
+        let compiled = crate::dsl::compiler::compile(
+            r#"policy "default" priority 100 { deny when true reason "blocked"; }"#,
+            "v1",
+        ).expect("test policy must compile");
+        store.swap(compiled);
+
+        let result = evaluate_inner(&one_call(), &store);
+        let decision = result.expect("evaluate_inner must succeed with a valid policy");
+        assert_eq!(decision.verdict, Verdict::Deny);
+        assert_eq!(decision.reason.as_deref(), Some("blocked"));
+        assert_eq!(decision.audit.policy_version, "v1");
+        assert_eq!(decision.audit.matched_rules, vec!["default".to_string()]);
+    }
+}
+```
+
+- [ ] **Step 4: Run evaluator tests to verify they pass**
+
+```bash
+cargo test --lib evaluator
+```
+
+Expected:
+- `evaluator::engine::tests`: 2 tests pass
+- `evaluator::mod::tests`: 10 tests pass
+- `evaluator::facts_loader::tests`: 4 tests pass (no regression)
+- `evaluator::builtins::tests`: 5 tests pass (no regression)
+- Total: 21 tests pass in the `evaluator` module.
+
+> **Debugging notes for implementer:**
+> - **`DataValue::Str` comparison**: `s.as_str()` on `SmartString<LazyCompact>` returns `&str`. If `.as_str()` isn't available, try `&*s` (via Deref) or `s.as_ref()`.
+> - **`result.rows` field**: Confirmed in Chunk 2's `cozo_mem_instance_runs_trivial_query` test. If `NamedRows` has a different field name, run `cargo doc -p cozo --open`.
+> - **`evaluate_allow_rule_returns_allow` returns Deny instead**: Add a temporary `eprintln!("decision_script={}", policy.decision_script)` inside `evaluate_inner` before `run_script` to inspect the compiled Cozo. Check that `agent_role[agent_id, "tester"]` is in the decision script and that the `$agent_roles` param contains the row `["agt-1", "tester"]`.
+> - **`evaluate_deny_when_true_populates_reason` returns `None`**: The `True` condition compiles to `tool_call[call_id, _, _]` — the reason comes from the `deny` rule's `reason` field embedded as a string in the Cozo body. If reason is missing, check `compile_policy_block` in `compiler.rs` to verify the reason string is correctly quoted with `cozo_str()`.
+> - **`parse_effects_json` fails with a real policy**: Add `eprintln!("effects_json={:?}", json_str)` before the `serde_json::from_str` call to inspect the raw string. Double-escaping (e.g. `[{\\\"type\\\"...}]`) means `compile_effects_json` in `compiler.rs` produced incorrectly escaped output.
+
+- [ ] **Step 5: Add `Engine` re-export to `src/lib.rs`**
+
+Read `src/lib.rs`. It ends with `pub use policy::store::PolicyStore;`. Add:
+
+```rust
+pub use evaluator::Engine;
+```
+
+- [ ] **Step 6: Run full test suite**
+
+```bash
+cargo test --lib
+```
+
+Expected: all tests pass; no regressions from Chunks 1–4.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/evaluator/engine.rs src/evaluator/mod.rs src/lib.rs
+git commit -m "feat: add evaluation engine (Engine, evaluate_inner, PolicyWatcher)"
+```
