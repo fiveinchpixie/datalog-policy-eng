@@ -1,0 +1,65 @@
+// src/dsl/grammar.pest
+
+// ── Whitespace and comments ───────────────────────────────────────────────────
+WHITESPACE = _{ " " | "\t" | "\n" | "\r" }
+COMMENT    = _{ "//" ~ (!"\n" ~ ANY)* ~ ("\n" | EOI) }
+
+// ── Primitives ────────────────────────────────────────────────────────────────
+ident        = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_" | "-")* }
+string       = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+raw_string   = @{ "r\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+integer      = @{ ASCII_DIGIT+ }
+pattern_ref  = @{ ":" ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+wildcard     = @{ "_" ~ (ASCII_ALPHANUMERIC | "_")* }
+
+// ── Top-level ─────────────────────────────────────────────────────────────────
+policy_file  =  { SOI ~ declaration* ~ EOI }
+declaration  =  { grant_decl | categorize_decl | classify_decl
+                | pattern_decl | rule_decl | policy_decl }
+
+// ── Policy facts ──────────────────────────────────────────────────────────────
+grant_decl   =  { "grant" ~ "role" ~ string ~ "can" ~ grant_perm ~ ";" }
+grant_perm   =  { call_any | call_category | access_pattern }
+call_any         = { "call" ~ "tool:any" }
+call_category    = { "call" ~ "tool:category" ~ "(" ~ string ~ ")" }
+access_pattern   = { "access" ~ "resource:pattern" ~ "(" ~ string ~ ")" }
+
+categorize_decl  = { "categorize" ~ "tool" ~ string ~ "as" ~ string ~ ";" }
+classify_decl    = { "classify" ~ "resource" ~ string ~ "as" ~ "sensitivity" ~ string ~ ";" }
+
+// ── Patterns ──────────────────────────────────────────────────────────────────
+pattern_decl     = { "pattern" ~ pattern_ref ~ "=" ~ raw_string ~ ";" }
+
+// ── Rules ─────────────────────────────────────────────────────────────────────
+rule_decl    =  { "rule" ~ ident ~ "(" ~ param_list ~ ")" ~ ":-" ~ condition_list ~ ";" }
+param_list   =  { param ~ ("," ~ param)* }
+param        =  { wildcard | ident }
+
+// ── Conditions ────────────────────────────────────────────────────────────────
+condition_list  =  { condition ~ ("," ~ condition)* }
+condition       = _{ not_condition | or_condition | atom_condition | true_kw }
+not_condition   =  { "not" ~ atom_condition }
+true_kw         =  { "true" }
+or_condition    =  { atom_condition ~ ("or" ~ atom_condition)+ }
+atom_condition  =  { ident ~ "(" ~ arg_list? ~ ")" }
+arg_list        =  { arg ~ ("," ~ arg)* }
+
+arg             =  { string | integer | pattern_ref | wildcard | ident }
+
+// ── Policy blocks ─────────────────────────────────────────────────────────────
+policy_decl  =  { "policy" ~ string ~ "priority" ~ integer ~ "{" ~ policy_rule* ~ "}" }
+policy_rule  =  { allow_rule | deny_rule }
+
+allow_rule   =  { "allow" ~ "when" ~ condition_list ~ effect_clause* ~ ";" }
+deny_rule    =  { "deny" ~ "when" ~ condition_list ~ reason_clause? ~ effect_clause* ~ ";" }
+
+reason_clause   = { "reason" ~ string }
+effect_clause   = { "effect" ~ effect_type }
+effect_type     = { redact_effect | mask_effect | annotate_effect | audit_effect }
+
+redact_effect   = { "Redact" ~ "(" ~ "selector:" ~ string ~ "," ~ "classifier:" ~ string ~ ")" }
+mask_effect     = { "Mask"   ~ "(" ~ "selector:" ~ string ~ "," ~ "pattern:"    ~ string ~ ","
+                              ~ "replacement:" ~ string ~ ")" }
+annotate_effect = { "Annotate" ~ "(" ~ "key:" ~ string ~ "," ~ "value:" ~ string ~ ")" }
+audit_effect    = { "Audit" ~ "(" ~ "level:" ~ audit_level ~ ")" }
+audit_level     = { "Critical" | "Elevated" | "Standard" }
