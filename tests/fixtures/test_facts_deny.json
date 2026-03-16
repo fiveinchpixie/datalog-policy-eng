@@ -1,0 +1,4 @@
+{
+  "tool_calls": [["call-1", "agt-1", "db_query"]],
+  "agent_roles": [["agt-1", "intern"]]
+}

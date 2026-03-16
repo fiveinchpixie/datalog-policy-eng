@@ -1,0 +1,6 @@
+policy "authz" priority 100 {
+    allow when
+        tool_call(call_id, agent_id, _),
+        agent_role(agent_id, "analyst");
+    deny when true reason "no matching allow rule";
+}
