@@ -5,6 +5,7 @@ pub mod facts;
 pub mod policy;
 pub mod types;
 
+pub mod cli;
 pub mod dsl;
 pub(crate) mod evaluator;
 

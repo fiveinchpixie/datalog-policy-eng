@@ -11,6 +11,12 @@ regex      = "1"
 parking_lot = "0.12"
 thiserror  = "1"
 serde_json = "1"
+clap       = { version = "4", features = ["derive"] }
+rustyline  = "15"
 
 [dev-dependencies]
 # none yet — added as needed
+
+[[bin]]
+name = "noodle"
+path = "src/bin/noodle.rs"
