@@ -504,6 +504,7 @@ dependencies = [
  "regex",
  "rustyline",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 
