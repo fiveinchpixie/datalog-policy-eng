@@ -31,6 +31,12 @@ pub enum LintKind {
 
 The function is public, re-exported from `src/dsl/mod.rs`. It takes a `&PolicyFile` (the parsed AST) and returns zero or more warnings. It does not fail — it always produces a result.
 
+`LintWarning` implements `Display` using the format `warning[{kind}]: {message}`. This is shared between the CLI subcommand and the REPL `:lint` command.
+
+### Helpers
+
+The linter needs to walk all `AtomCondition` nodes across rules and policy blocks to collect referenced predicates and pattern names. The compiler's `validate()` function does similar pattern-ref walking. A shared helper `collect_all_predicates(file) -> HashSet<String>` and `collect_pattern_refs(file) -> HashSet<String>` should be extracted into a utility used by both the linter and the compiler. Alternatively, the linter may duplicate the traversal since it's simple and the linter has different concerns — either approach is acceptable.
+
 ### Lint checks
 
 #### 1. MissingDefaultDeny
@@ -45,17 +51,17 @@ Message: `policy block "{name}" has allow rules but no deny-when-true fallback; 
 
 A `pattern :name` declaration whose name never appears as a `PatternRef` argument in any `matches()` call across all rules and policy block conditions.
 
-Detection: Collect all declared pattern names from `Declaration::Pattern`. Walk all `AtomCondition` nodes in all rules and policy blocks. For each `matches(value, :pattern_name)` call, record the pattern name. Any declared name not referenced is unused.
+Detection: Collect all declared pattern names from `Declaration::Pattern`. Walk all `AtomCondition` nodes in all rules and policy blocks, collecting pattern names from `PatternRef` args in `matches()` predicates. Any declared name not in the referenced set is unused.
 
 Message: `pattern :{name} is declared but never used`
 
 #### 3. UnusedRule
 
-A `rule name(...)` declaration whose name never appears as a predicate in any policy block condition or other rule's body.
+A `rule name(...)` declaration that is not reachable from any policy block.
 
-Detection: Collect all declared rule names from `Declaration::Rule`. Walk all `AtomCondition` nodes in policy blocks and other rules. Any declared name not appearing as a predicate is unused.
+Detection: Collect all declared rule names from `Declaration::Rule`. Collect all predicates referenced directly in policy block conditions. A rule is "used" if its name appears as a predicate in any policy block condition. Rules that are only referenced by other rules but never reachable from a policy block are considered unused. (This is a simple one-hop check from policy blocks, not a full reachability graph — a rule referenced only by another unused rule is also flagged.)
 
-Message: `rule "{name}" is declared but never used`
+Message: `rule "{name}" is declared but never referenced from a policy block`
 
 #### 4. UnusedGrant
 
@@ -81,9 +87,7 @@ Message: `classify declarations exist but no rule references resource_sensitivit
 
 A lower-priority policy block that can never produce a decision because a higher-priority block always matches first.
 
-Detection: Sort policy blocks by priority descending. For each block, check if any higher-priority block has a `deny when true` or covers all tool_calls unconditionally (i.e., has a rule matching `tool_call(_, _, _)` with no further restricting conditions beyond that). If so, the lower-priority block is shadowed.
-
-Simplified approach: if a higher-priority block contains `deny when true` as one of its rules, it produces a decision for every request, shadowing all lower-priority blocks. Note: a block with `allow when ... ; deny when true` also matches everything.
+Detection: Sort policy blocks by priority descending. A block "matches all requests" if it contains any `deny when true` rule (regardless of whether it also has allow rules — the deny-when-true fallback ensures it produces a decision for every call_id that has a tool_call). If a higher-priority block matches all requests, all lower-priority blocks are shadowed.
 
 Message: `policy block "{name}" (priority {p}) is shadowed by higher-priority block "{other}" (priority {hp}) which matches all requests`
 
@@ -99,7 +103,7 @@ Message: `policy block "{name}" has no rules`
 
 A deny rule in a policy block that can never produce a decision because a broader allow rule in the same block always takes precedence (allow beats deny in same block).
 
-Detection: Within a single policy block, if there is an allow rule whose conditions are a subset of (or equal to) a deny rule's conditions, the deny is unreachable. Simplified check: if the block has an allow rule with only `tool_call(call_id, _, _)` as its condition (matches all calls), then any deny rule in the same block is unreachable because the allow will always fire first.
+Detection: Within a single policy block, check if any allow rule's conditions are a superset of (or match all cases of) a deny rule. Simplified check: if the block has an allow rule whose conditions consist only of `tool_call(_, _, _)` (one atom, all wildcards/variables) or whose conditions are empty or `[True]`, then all deny rules in the same block are unreachable. (Note: `allow when true` is rejected by compiler validation, so only the `tool_call`-only case is practically reachable.)
 
 Message: `deny rule in policy block "{name}" is unreachable because a broader allow rule always takes precedence`
 
@@ -111,7 +115,7 @@ Usage: `noodle lint <policy.dl>`
 
 1. Parse the policy file
 2. Run `lint()` on the AST
-3. Print warnings to stdout
+3. Print warnings to stdout using `LintWarning::Display`
 4. Print summary line: `N warnings` or `no warnings`
 5. Exit code: 0 if no warnings, 1 if warnings found
 
@@ -123,17 +127,37 @@ Usage: `:lint` (no arguments — lints the currently loaded policy file)
 
 1. Re-reads and re-parses the file at `state.policy_path`
 2. Runs `lint()` on the AST
-3. Prints warnings to stdout
-4. If no policy is loaded, prints "no policy loaded" to stderr
+3. Prints warnings to stdout using `LintWarning::Display`
+4. Prints summary line
+5. If no policy is loaded, prints "no policy loaded" to stderr
+
+The `:lint` command is added to `handle_command` and documented in `print_help()`.
 
 ### Arg parsing changes
 
-The current CLI uses positional args only (`noodle [policy] [facts]`). To add `lint`:
+The current CLI uses clap with positional args. Add an optional `Subcommand` enum to clap:
 
-- In `src/bin/noodle.rs`, check if the first positional argument is the literal string `"lint"`. If so, treat the second positional arg as the policy file path and run the lint subcommand.
-- Otherwise, existing behavior is unchanged.
+```rust
+#[derive(Parser)]
+struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
 
-This avoids adding clap subcommands, keeping the arg parsing simple.
+    /// Policy DSL file to load
+    policy: Option<PathBuf>,
+
+    /// Facts JSON file to evaluate (enables one-shot mode)
+    facts: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Lint a policy file for common issues
+    Lint { policy: PathBuf },
+}
+```
+
+When `args.command` is `Some(Command::Lint { policy })`, run the lint subcommand. Otherwise, existing positional-arg behavior is unchanged. This gives proper `--help` documentation for both modes.
 
 ### Output format
 
