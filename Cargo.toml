@@ -16,7 +16,7 @@ clap       = { version = "4", features = ["derive"] }
 rustyline  = "15"
 
 [dev-dependencies]
-# none yet — added as needed
+tempfile = "3"
 
 [[bin]]
 name = "noodle"

@@ -505,6 +505,7 @@ dependencies = [
  "rustyline",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
 ]
 
