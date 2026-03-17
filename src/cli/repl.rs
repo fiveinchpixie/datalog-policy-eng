@@ -1,14 +1,17 @@
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use rustyline::error::ReadlineError;
 use crate::cli::facts_json;
 use crate::cli::output;
+use crate::policy::file_watcher::{PolicyFileWatcher, WatchEvent};
 use crate::{Engine, PolicySet, PolicyWatcher};
 
 struct ReplState {
     engine: Engine,
     policy_path: Option<PathBuf>,
     version_counter: u32,
+    watcher: Option<PolicyFileWatcher>,
 }
 
 impl ReplState {
@@ -17,6 +20,7 @@ impl ReplState {
             engine: Engine::new(),
             policy_path: None,
             version_counter: 0,
+            watcher: None,
         }
     }
 
@@ -135,6 +139,45 @@ fn handle_command(input: &str, state: &mut ReplState, _use_color: bool) {
                 _ => println!("no policy loaded"),
             }
         }
+        ":watch" | ":w" => {
+            if let Some(path) = parts.get(1).map(|s| s.trim()) {
+                // Stop existing watcher if any
+                state.watcher.take();
+                let file_path = Path::new(path);
+                match PolicyFileWatcher::start(
+                    file_path,
+                    state.engine.clone(),
+                    Duration::from_secs(2),
+                    |event| match event {
+                        WatchEvent::Reloaded { version, path } => {
+                            eprintln!("[watch] reloaded {} ({})", path.display(), version);
+                        }
+                        WatchEvent::CompileError { error, path } => {
+                            eprintln!("[watch] compile error in {}: {}", path.display(), error);
+                        }
+                        WatchEvent::IoError { error, path } => {
+                            eprintln!("[watch] I/O error reading {}: {}", path.display(), error);
+                        }
+                    },
+                ) {
+                    Ok(w) => {
+                        state.policy_path = Some(file_path.to_path_buf());
+                        state.watcher = Some(w);
+                        eprintln!("watching {} (poll every 2s)", path);
+                    }
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            } else {
+                eprintln!("usage: :watch <path>");
+            }
+        }
+        ":unwatch" => {
+            if state.watcher.take().is_some() {
+                eprintln!("stopped watching");
+            } else {
+                eprintln!("no active watch");
+            }
+        }
         ":example" | ":e" => print_example(),
         other => eprintln!("unknown command: {other}  (type :help for commands)"),
     }
@@ -169,6 +212,8 @@ fn print_help() {
     println!("  :reload        Reload current policy file");
     println!("  :policy        Show loaded policy info");
     println!("  :example       Print an example JSON fact package");
+    println!("  :watch <path>  Watch a policy file for changes (auto-reload)");
+    println!("  :unwatch       Stop watching");
     println!("  :help          Show this help");
     println!("  :quit          Exit (also Ctrl-D)");
     println!();
