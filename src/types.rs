@@ -25,7 +25,9 @@ pub struct Uri(pub String);
 pub enum Op {
     Read,
     Write,
+    Create,
     Delete,
+    List,
     Execute,
 }
 
@@ -34,7 +36,9 @@ impl Op {
         match self {
             Op::Read    => "read",
             Op::Write   => "write",
+            Op::Create  => "create",
             Op::Delete  => "delete",
+            Op::List    => "list",
             Op::Execute => "execute",
         }
     }

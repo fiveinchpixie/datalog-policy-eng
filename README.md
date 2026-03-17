@@ -91,7 +91,7 @@ These predicates match against the request's `FactPackage`:
 | `user` | `(user_id, agent_id)` |
 | `call_arg` | `(call_id, key, value)` |
 | `tool_result` | `(call_id, key, value)` |
-| `resource_access` | `(call_id, agent_id, uri, op)` |
+| `resource_access` | `(call_id, agent_id, uri, op)` — op: read, write, create, delete, list, execute |
 | `resource_mime` | `(call_id, mime_type)` |
 | `content_tag` | `(call_id, tag, value)` |
 | `timestamp` | `(call_id, unix_ts)` |

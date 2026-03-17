@@ -123,10 +123,12 @@ fn parse_op(s: &str) -> Result<Op, FactsJsonError> {
     match s {
         "read"    => Ok(Op::Read),
         "write"   => Ok(Op::Write),
+        "create"  => Ok(Op::Create),
         "delete"  => Ok(Op::Delete),
+        "list"    => Ok(Op::List),
         "execute" => Ok(Op::Execute),
         other     => Err(FactsJsonError(format!(
-            "invalid op \"{other}\": expected read, write, delete, or execute"
+            "invalid op \"{other}\": expected read, write, create, delete, list, or execute"
         ))),
     }
 }
@@ -245,8 +247,8 @@ mod tests {
     }
 
     #[test]
-    fn all_four_op_values_accepted() {
-        for (op_str, expected) in [("read", Op::Read), ("write", Op::Write), ("delete", Op::Delete), ("execute", Op::Execute)] {
+    fn all_six_op_values_accepted() {
+        for (op_str, expected) in [("read", Op::Read), ("write", Op::Write), ("create", Op::Create), ("delete", Op::Delete), ("list", Op::List), ("execute", Op::Execute)] {
             let v = serde_json::json!({"resource_accesses": [["c", "a", "u", op_str]]});
             let pkg = parse_facts_json(&v).unwrap();
             assert_eq!(pkg.resource_accesses[0].op, expected);
