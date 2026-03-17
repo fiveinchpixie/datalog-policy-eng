@@ -4,6 +4,7 @@ use std::time::Duration;
 use rustyline::error::ReadlineError;
 use crate::cli::facts_json;
 use crate::cli::output;
+use crate::dsl::linter;
 use crate::policy::file_watcher::{PolicyFileWatcher, WatchEvent};
 use crate::{Engine, PolicySet, PolicyWatcher};
 
@@ -178,6 +179,35 @@ fn handle_command(input: &str, state: &mut ReplState, _use_color: bool) {
                 eprintln!("no active watch");
             }
         }
+        ":lint" => {
+            if let Some(path) = &state.policy_path {
+                let source = match std::fs::read_to_string(path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("error reading {}: {e}", path.display());
+                        return;
+                    }
+                };
+                let ast = match crate::dsl::parser::parse(&source) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("parse error: {e}");
+                        return;
+                    }
+                };
+                let warnings = linter::lint(&ast);
+                for w in &warnings {
+                    println!("{w}");
+                }
+                if warnings.is_empty() {
+                    println!("no warnings");
+                } else {
+                    println!("\n{} warning{}", warnings.len(), if warnings.len() == 1 { "" } else { "s" });
+                }
+            } else {
+                eprintln!("no policy loaded; use :load <path> first");
+            }
+        }
         ":example" | ":e" => print_example(),
         other => eprintln!("unknown command: {other}  (type :help for commands)"),
     }
@@ -212,6 +242,7 @@ fn print_help() {
     println!("  :reload        Reload current policy file");
     println!("  :policy        Show loaded policy info");
     println!("  :example       Print an example JSON fact package");
+    println!("  :lint          Lint the current policy for common issues");
     println!("  :watch <path>  Watch a policy file for changes (auto-reload)");
     println!("  :unwatch       Stop watching");
     println!("  :help          Show this help");
