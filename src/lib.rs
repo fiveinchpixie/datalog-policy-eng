@@ -16,6 +16,7 @@ pub use facts::FactPackage;
 pub use policy::watcher::{PolicySet, PolicyWatcher};
 pub use policy::store::PolicyStore;
 pub use evaluator::Engine;
+pub use dsl::linter::{lint, LintWarning, LintKind};
 
 /// Parse a DSL source string into a `PolicyFile` AST.
 pub fn dsl_parse(source: &str) -> Result<dsl::ast::PolicyFile, error::PolicyError> {
